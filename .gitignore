@@ -1,0 +1,19 @@
+# Runtime state and local config
+.9router-sync-state.json
+.9router-sync-limits.json
+opencode.json
+opencode.jsonc
+
+# Backups and temporary files
+*.bak-*
+*.tmp-*
+*.log
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Dependencies (script has none, keep this for future)
+node_modules/

@@ -1,0 +1,1077 @@
+#!/usr/bin/env node
+"use strict";
+
+/*
+ * sync-9router-opencode
+ *
+ * Generic 9router -> OpenCode config sync.
+ *
+ * Design rules:
+ *  - No provider ids, prefixes, names, model ids or model allowlists are
+ *    hardcoded. Everything comes from the running 9router instance.
+ *  - The live router catalog (/v1/models) is the source of truth.
+ *  - /api/provider-nodes supplies custom provider names and node id -> prefix.
+ *  - /api/models supplies human model names, capabilities and limits.
+ *  - /api/models/availability is optional and only used to report/downrank
+ *    permanently unavailable entries.
+ *  - Existing OpenCode config is only used to preserve provider ids/names and
+ *    non-managed settings, never to decide which models exist.
+ */
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { execFileSync } = require("child_process");
+
+const VERSION = "4.1.0";
+const HOME = process.env.HOME || os.homedir();
+const DEFAULT_PORT = process.env.ROUTER_PORT || "20128";
+const STATE_BASENAME = ".9router-sync-state.json";
+const LIMITS_BASENAME = ".9router-sync-limits.json";
+
+const DEFAULTS = {
+  package: process.env.OPENCODE_COMPATIBLE_PACKAGE || "@opencode/ai/providers/openai-compatible",
+  schema: process.env.OPENCODE_SCHEMA || "https://opencode.ai/config.json",
+  modelsPath: process.env.ROUTER_MODELS_PATH || "/v1/models",
+  apiModelsPath: process.env.ROUTER_API_MODELS_PATH || "/api/models",
+  providerNodesPath: process.env.ROUTER_PROVIDER_NODES_PATH || "/api/provider-nodes",
+  availabilityPath: process.env.ROUTER_AVAILABILITY_PATH || "/api/models/availability",
+  dbPath: process.env.ROUTER_DB_PATH || path.join(HOME, ".9router", "db", "data.sqlite"),
+  dbKeyQuery:
+    process.env.ROUTER_DB_KEY_QUERY ||
+    "SELECT key FROM apiKeys WHERE isActive = 1 ORDER BY createdAt ASC LIMIT 1",
+  dbNodesQuery:
+    process.env.ROUTER_DB_NODES_QUERY ||
+    "SELECT provider, data FROM providerConnections WHERE isActive = 1",
+  upstreamTimeout: Number(process.env.ROUTER_UPSTREAM_TIMEOUT || 20),
+};
+
+const OPTION_SPEC = {
+  help: { type: "bool", short: "h" },
+  version: { type: "bool", short: "v" },
+  dryRun: { type: "bool", short: "n", long: "dry-run" },
+  config: { type: "string" },
+  router: { type: "string" },
+  apiBase: { type: "string", long: "api-base" },
+  apiKey: { type: "string", long: "api-key" },
+  db: { type: "string" },
+  dbKeyQuery: { type: "string", long: "db-key-query" },
+  dbNodesQuery: { type: "string", long: "db-nodes-query" },
+  package: { type: "string" },
+  schema: { type: "string" },
+  modelsPath: { type: "string", long: "models-path" },
+  apiModelsPath: { type: "string", long: "api-models-path" },
+  providerNodesPath: { type: "string", long: "provider-nodes-path" },
+  availabilityPath: { type: "string", long: "availability-path" },
+  provider: { type: "list" },
+  exclude: { type: "list" },
+  model: { type: "list" },
+  excludeModel: { type: "list", long: "exclude-model" },
+  limit: { type: "number" },
+  keepMissing: { type: "bool", long: "keep-missing" },
+  pruneMissing: { type: "bool", long: "prune-missing" },
+  replace: { type: "bool" },
+  backup: { type: "bool" },
+  noBackup: { type: "bool", long: "no-backup" },
+  reload: { type: "bool" },
+  noReload: { type: "bool", long: "no-reload" },
+  minModels: { type: "number", long: "min-models" },
+  allowEmpty: { type: "bool", long: "allow-empty" },
+  json: { type: "bool" },
+  quiet: { type: "bool" },
+  verbose: { type: "bool" },
+  showUnavailable: { type: "bool", long: "show-unavailable" },
+  showContext: { type: "bool", long: "show-context" },
+  noUpstreamMetadata: { type: "bool", long: "no-upstream-metadata" },
+  upstreamTimeout: { type: "number", long: "upstream-timeout" },
+};
+
+let opts = {};
+let apiKey = "";
+let baseURL = "";
+let apiBase = "";
+let dbPath = DEFAULTS.dbPath;
+let configPath = "";
+let statePath = "";
+let limitOverrides = {};
+
+const clone = (value) => (value == null ? value : JSON.parse(JSON.stringify(value)));
+
+function printHelp() {
+  console.log(
+    [
+      `sync-9router-opencode v${VERSION}`,
+      "",
+      "Generic 9router -> OpenCode config sync. No hardcoded providers or models.",
+      "",
+      "USAGE",
+      "  sync-9router-opencode [options]",
+      "",
+      "OPTIONS",
+      "  -h, --help               Show this help",
+      "  -v, --version            Show version",
+      "  -n, --dry-run            Build but do not write",
+      "      --config <path>      OpenCode config path",
+      "      --router <url>       9router URL",
+      "      --api-base <url>     9router API base URL",
+      "      --api-key <key>      9router API key",
+      "      --db <path>          9router SQLite database",
+      "      --db-key-query <sql> SQL used to read the API key from the DB",
+      "      --db-nodes-query <sql>",
+      "                           SQL used to read provider connection keys",
+      "      --no-upstream-metadata",
+      "                           Do not read /models from upstream providers",
+      "      --upstream-timeout <s> Upstream metadata timeout (default 20)",
+      "      --package <name>     OpenCode provider package",
+      "      --schema <url>       OpenCode config $schema",
+      "      --models-path <path> Override /v1/models path",
+      "      --api-models-path <path>",
+      "      --provider-nodes-path <path>",
+      "      --availability-path <path>",
+      "",
+      "FILTERS",
+      "      --provider <list>    Only matching providers (repeatable/comma list)",
+      "      --exclude <list>     Skip matching providers",
+      "      --model <glob>       Only matching model ids",
+      "      --exclude-model <glob>",
+      "      --limit <n>          Max models per provider (0 = unlimited)",
+      "",
+      "CONFIG SAFETY",
+      "      --keep-missing       Keep managed providers/models missing upstream",
+      "      --prune-missing      Drop them (default)",
+      "      --replace            Replace the whole provider map",
+      "      --no-backup          Do not write a backup",
+      "      --no-reload          Do not run 'opencode reload'",
+      "      --min-models <n>     Abort below this many managed models (default 1)",
+      "      --allow-empty        Allow an empty result",
+      "      --json               Machine-readable summary",
+      "      --show-unavailable   Show router-reported down connections",
+      "      --show-context       Print per-model context window + source",
+      "      --quiet, --verbose",
+      "",
+      "SOURCE OF TRUTH",
+      `  models:      ${DEFAULTS.modelsPath}`,
+      `  api models:  ${DEFAULTS.apiModelsPath}`,
+      `  nodes:       ${DEFAULTS.providerNodesPath}`,
+      `  health:      ${DEFAULTS.availabilityPath}`,
+    ].join("\n")
+  );
+}
+
+function parseArgs(argv) {
+  const parsed = {};
+  const longByKey = {};
+  const shortByKey = {};
+  for (const [key, spec] of Object.entries(OPTION_SPEC)) {
+    longByKey[spec.long || key] = key;
+    if (spec.short) shortByKey[spec.short] = key;
+  }
+
+  const fail = (msg) => {
+    throw new Error(`${msg}\nRun with --help for usage.`);
+  };
+  const set = (key, value) => {
+    const spec = OPTION_SPEC[key];
+    if (!spec) fail(`Unknown option: ${key}`);
+    if (spec.type === "list") {
+      const values = String(value)
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean);
+      parsed[key] = (parsed[key] || []).concat(values);
+    } else if (spec.type === "number") {
+      const n = Number(value);
+      if (!Number.isFinite(n)) fail(`--${spec.long || key} expects a number`);
+      parsed[key] = n;
+    } else {
+      parsed[key] = value;
+    }
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith("--")) {
+      let body = arg.slice(2);
+      let inline;
+      const eq = body.indexOf("=");
+      if (eq !== -1) {
+        inline = body.slice(eq + 1);
+        body = body.slice(0, eq);
+      }
+      const key = longByKey[body];
+      if (!key) fail(`Unknown option: --${body}`);
+      const spec = OPTION_SPEC[key];
+      if (spec.type === "bool") {
+        set(key, inline === undefined ? true : !/^(0|false|no|off)$/i.test(inline));
+      } else {
+        const value = inline !== undefined ? inline : argv[++i];
+        if (value === undefined) fail(`--${body} requires a value`);
+        set(key, value);
+      }
+      continue;
+    }
+    if (arg.startsWith("-") && arg.length > 1) {
+      const key = shortByKey[arg.slice(1)];
+      if (!key) fail(`Unknown option: ${arg}`);
+      set(key, true);
+      continue;
+    }
+    fail(`Unexpected argument: ${arg}`);
+  }
+  return parsed;
+}
+
+function normalizeOptions(raw) {
+  const o = { ...raw };
+  for (const key of ["provider", "exclude", "model", "excludeModel"]) {
+    if (!Array.isArray(o[key])) o[key] = [];
+  }
+  o.dryRun = !!o.dryRun;
+  o.json = !!o.json;
+  o.quiet = !!o.quiet;
+  o.verbose = !!o.verbose && !o.quiet && !o.json;
+  o.keepMissing = !!o.keepMissing;
+  if (o.keepMissing && o.pruneMissing) throw new Error("Use either --keep-missing or --prune-missing");
+  o.replace = !!o.replace;
+  o.backup = !o.noBackup && o.backup !== false;
+  o.reload = !o.noReload && o.reload !== false;
+  o.limit = o.limit != null ? Math.max(0, Math.floor(o.limit)) : 0;
+  o.minModels = o.minModels != null ? Math.max(0, Math.floor(o.minModels)) : 1;
+  o.allowEmpty = !!o.allowEmpty;
+  o.showUnavailable = !!o.showUnavailable;
+  o.showContext = !!o.showContext;
+  o.noUpstreamMetadata = !!o.noUpstreamMetadata;
+  o.upstreamTimeout =
+    o.upstreamTimeout != null && Number.isFinite(o.upstreamTimeout)
+      ? Math.max(1, Math.floor(o.upstreamTimeout))
+      : DEFAULTS.upstreamTimeout;
+  return o;
+}
+
+function info(msg = "") {
+  if (!opts.quiet && !opts.json) console.log(msg);
+}
+function verbose(msg = "") {
+  if (opts.verbose) console.log(msg);
+}
+function warn(msg) {
+  console.error(msg);
+}
+
+function expandHome(p) {
+  if (!p) return p;
+  if (p === "~") return HOME;
+  if (p.startsWith("~/")) return path.join(HOME, p.slice(2));
+  return p;
+}
+
+function normalizeRouter(value) {
+  let raw = String(value || "").trim() || `http://localhost:${DEFAULT_PORT}`;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = `http://${raw}`;
+  raw = raw.replace(/\/+$/, "");
+  if (/\/v1$/i.test(raw)) return { baseURL: raw, apiBase: raw.replace(/\/v1$/i, "") };
+  return { baseURL: `${raw}/v1`, apiBase: raw };
+}
+
+function parseMaybeJson(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
+  try { return JSON.parse(value); } catch (_) { return {}; }
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    if (value != null && value !== "" && Number.isFinite(Number(value))) return Number(value);
+  }
+  return null;
+}
+
+function findConfigPath() {
+  const root = process.env.XDG_CONFIG_HOME ? path.resolve(process.env.XDG_CONFIG_HOME) : path.join(HOME, ".config");
+  const dir = path.join(root, "opencode");
+  const json = path.join(dir, "opencode.json");
+  const jsonc = path.join(dir, "opencode.jsonc");
+  if (fs.existsSync(json)) return json;
+  if (fs.existsSync(jsonc)) return jsonc;
+  return json;
+}
+
+function stripComments(text) {
+  let out = "";
+  let i = 0;
+  let inString = false;
+  let quote = "";
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (inString) {
+      out += ch;
+      if (ch === "\\" && i + 1 < text.length) out += text[++i];
+      else if (ch === quote) inString = false;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      i += 2;
+      while (i < text.length && text[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function stripTrailingCommas(text) {
+  let out = "";
+  let i = 0;
+  let inString = false;
+  let quote = "";
+  while (i < text.length) {
+    const ch = text[i];
+    if (inString) {
+      out += ch;
+      if (ch === "\\" && i + 1 < text.length) out += text[++i];
+      else if (ch === quote) inString = false;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === "}" || text[j] === "]") {
+        i++;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function parseJsonc(text) {
+  return JSON.parse(stripTrailingCommas(stripComments(text)));
+}
+
+function atomicWrite(file, content, mode = 0o600) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.tmp-${process.pid}-${Date.now()}`);
+  try {
+    fs.writeFileSync(tmp, content, { mode });
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+    throw err;
+  }
+}
+
+function backupFile(file) {
+  if (!fs.existsSync(file)) return null;
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").replace(/\..+/, "");
+  let backup = `${file}.bak-${stamp}`;
+  if (fs.existsSync(backup)) backup += `-${process.pid}`;
+  fs.copyFileSync(file, backup);
+  fs.chmodSync(backup, 0o600);
+  return backup;
+}
+
+function loadConfig() {
+  if (!fs.existsSync(configPath)) return { config: {}, raw: null };
+  const raw = fs.readFileSync(configPath, "utf8");
+  let config;
+  try {
+    config = parseJsonc(raw);
+  } catch (err) {
+    throw new Error(`Could not parse ${configPath}: ${err.message}. Refusing to overwrite it.`);
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error(`${configPath} must contain a JSON object`);
+  }
+  if (config.providers != null && (typeof config.providers !== "object" || Array.isArray(config.providers))) {
+    throw new Error(`${configPath}: "providers" must be an object`);
+  }
+  return { config, raw };
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(statePath)) return {};
+    const value = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    return value && typeof value === "object" ? value : {};
+  } catch (err) {
+    warn(`Warning: ignoring unreadable state ${statePath}: ${err.message}`);
+    return {};
+  }
+}
+
+function readLimitOverrides(file) {
+  try {
+    if (!fs.existsSync(file)) return {};
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!parsed || typeof parsed !== "object") return {};
+    const out = {};
+    for (const [id, value] of Object.entries(parsed)) {
+      if (!value || typeof value !== "object") continue;
+      const entry = {};
+      if (Number.isFinite(value.context)) entry.context = value.context;
+      if (Number.isFinite(value.output)) entry.output = value.output;
+      if (Object.keys(entry).length) out[id] = entry;
+    }
+    return out;
+  } catch (err) {
+    warn(`Warning: ignoring unreadable limits ${file}: ${err.message}`);
+    return {};
+  }
+}
+
+let nodeSqlite;
+function dbQuery(sql) {
+  if (nodeSqlite === undefined) {
+    try { nodeSqlite = require("node:sqlite"); } catch (_) { nodeSqlite = null; }
+  }
+  if (nodeSqlite && nodeSqlite.DatabaseSync) {
+    const db = new nodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+    try {
+      return db.prepare(sql).all().map((row) => ({ ...row }));
+    } finally {
+      db.close();
+    }
+  }
+  const py = [
+    "import sqlite3,sys,json",
+    "con=sqlite3.connect(sys.argv[1])",
+    "try:",
+    " cur=con.execute(sys.argv[2])",
+    " cols=[d[0] for d in cur.description]",
+    " print(json.dumps([dict(zip(cols,r)) for r in cur.fetchall()]))",
+    "finally:",
+    " con.close()",
+  ].join("\n");
+  const out = execFileSync("python3", ["-c", py, dbPath, sql], { encoding: "utf8" });
+  return JSON.parse(out);
+}
+
+function getApiKeyFromDb() {
+  const rows = dbQuery(opts.dbKeyQuery || DEFAULTS.dbKeyQuery);
+  const row = rows[0] || {};
+  for (const key of ["key", "apiKey", "value", "token"]) {
+    if (typeof row[key] === "string" && row[key].trim()) return row[key].trim();
+  }
+  return null;
+}
+
+async function getUpstreamModelMeta(nodes) {
+  const out = new Map();
+  if (opts.noUpstreamMetadata || !nodes.length) return out;
+
+  let rows = [];
+  try {
+    rows = dbQuery(opts.dbNodesQuery || DEFAULTS.dbNodesQuery);
+  } catch (err) {
+    warn(`Warning: could not read provider connections: ${err.message}`);
+    return out;
+  }
+
+  const keyByProvider = new Map();
+  for (const row of rows) {
+    if (!row || !row.provider) continue;
+    const data = parseMaybeJson(row.data);
+    const key = data.apiKey || data.key || data.token || data.accessToken;
+    if (typeof key === "string" && key.trim() && !keyByProvider.has(String(row.provider))) {
+      keyByProvider.set(String(row.provider), key.trim());
+    }
+  }
+
+  const jobs = [];
+  for (const node of nodes) {
+    if (!node || !node.id || !node.prefix) continue;
+    const key = keyByProvider.get(String(node.id));
+    if (!key) continue;
+    const nd = parseMaybeJson(node.data);
+    const base = String(nd.baseUrl || node.baseUrl || "").replace(/\/+$/, "");
+    if (!base) continue;
+    jobs.push((async () => {
+      const url = `${base}/models`;
+      try {
+        const raw = await fetchJson(url, opts.upstreamTimeout * 1000, false, key);
+        if (!raw) return;
+        const list = Array.isArray(raw) ? raw : Array.isArray(raw.data) ? raw.data : [];
+        for (const model of list) {
+          if (!model || !model.id) continue;
+          const context = firstFinite(
+            model.context_window,
+            model.contextWindow,
+            model.context_length,
+            model.context
+          );
+          const output = firstFinite(
+            model.max_output_tokens,
+            model.maxOutputTokens,
+            model.max_output,
+            model.max_completion_tokens
+          );
+          if (context == null && output == null) continue;
+          out.set(`${node.prefix}/${model.id}`, { context, output, source: "upstream" });
+        }
+      } catch (err) {
+        verbose(`(upstream) ${node.prefix}: ${err.message}`);
+      }
+    })());
+  }
+
+  await Promise.all(jobs);
+  return out;
+}
+
+async function fetchJson(url, timeoutMs = 30000, required = true, authOverride) {
+  try {
+    const token = authOverride !== undefined ? authOverride : apiKey;
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${String(text).slice(0, 200)}`);
+    return json;
+  } catch (err) {
+    if (!required) {
+      verbose(`(optional) ${url}: ${err.message}`);
+      return null;
+    }
+    throw err;
+  }
+}
+
+function sanitizeProviderId(value) {
+  const s = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return s || "provider";
+}
+
+function sanitizeModelKey(value) {
+  const s = String(value || "")
+    .replace(/#/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/^[-/]+/, "")
+    .replace(/[-/]+$/, "");
+  return s || "model";
+}
+
+function humanize(value) {
+  let s = String(value || "")
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return "Model";
+  s = s
+    .split(" ")
+    .map((part) => {
+      if (!part) return part;
+      if (/^[A-Z0-9.]+$/.test(part)) return part;
+      if (/^\d/.test(part)) return part;
+      return part.charAt(0).toUpperCase() + part.slice(1);
+    })
+    .join(" ");
+  return s.replace(/\b(\d+)\s*\.\s*(\d+)\b/g, "$1.$2");
+}
+
+function normalizeCompare(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function leafOf(modelPart) {
+  return String(modelPart).includes("/") ? String(modelPart).slice(String(modelPart).lastIndexOf("/") + 1) : String(modelPart);
+}
+
+function chooseModelName(entry, modelPart) {
+  const leaf = leafOf(modelPart);
+  const name = entry && typeof entry.name === "string" ? entry.name.trim() : "";
+  if (name && /\s/.test(name) && (normalizeCompare(name) === normalizeCompare(leaf) || normalizeCompare(name) === normalizeCompare(modelPart))) {
+    return name;
+  }
+  return humanize(leaf);
+}
+
+function globToRegex(glob) {
+  let out = "";
+  for (const ch of String(glob)) {
+    if (ch === "*") out += ".*";
+    else if (ch === "?") out += ".";
+    else out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${out}$`, "i");
+}
+
+function matchesAny(value, patterns) {
+  return patterns.some((pattern) => globToRegex(pattern).test(value));
+}
+
+function providerMatches(meta, filters) {
+  if (!filters.length) return true;
+  const haystack = [meta.id, meta.prefix, meta.name].map((v) => String(v).toLowerCase());
+  return filters.some((filter) => {
+    const f = String(filter).toLowerCase();
+    return haystack.some((v) => v === f || v.includes(f));
+  });
+}
+
+const PERMANENT_ERROR_RE =
+  /(^|[^0-9])(400|401|403|404|410|422)([^0-9]|$)|not found|does not exist|no such model|unknown model|invalid model|model_not_supported|no active credentials|api key required/i;
+
+function isPermanentError(detail) {
+  return PERMANENT_ERROR_RE.test(String(detail || ""));
+}
+
+function capabilitiesFrom(caps) {
+  const c = caps || {};
+  const input = ["text"];
+  if (c.vision === true || c.imageInput === true) input.push("image");
+  if (c.pdf === true) input.push("pdf");
+  if (c.audioInput === true) input.push("audio");
+  if (c.videoInput === true) input.push("video");
+  const output = ["text"];
+  if (c.imageOutput === true) output.push("image");
+  if (c.audioOutput === true) output.push("audio");
+  const result = {
+    tools: c.tools !== false,
+    input: [...new Set(input)],
+    output: [...new Set(output)],
+  };
+  if (c.reasoning === true) result.reasoning = { supported: true };
+  return result;
+}
+
+function limitFor(model) {
+  const override = limitOverrides[model.id];
+  if (override && (override.context > 0 || override.output > 0)) {
+    const out = {};
+    if (override.context > 0) out.context = override.context;
+    if (override.output > 0) out.output = override.output;
+    return out;
+  }
+  const out = {};
+  if (Number.isFinite(model.context) && model.context > 0) out.context = model.context;
+  if (Number.isFinite(model.output) && model.output > 0) out.output = model.output;
+  return Object.keys(out).length ? out : undefined;
+}
+
+function pickPackage(providerId, existingProviders) {
+  if (opts.package) return opts.package;
+  const own = existingProviders[providerId];
+  if (own && typeof own.package === "string" && own.package) return own.package;
+  for (const provider of Object.values(existingProviders)) {
+    if (provider && typeof provider.package === "string" && provider.package) return provider.package;
+  }
+  return DEFAULTS.package;
+}
+
+function contextSourceFor(model) {
+  const override = limitOverrides[model.id];
+  if (override && (override.context > 0 || override.output > 0)) return "override";
+  return model.contextSource || "router";
+}
+
+function buildProviders(models, existingProviders) {
+  const groups = new Map();
+  for (const model of models) {
+    if (!groups.has(model.providerId)) {
+      groups.set(model.providerId, { name: model.providerName, models: [] });
+    }
+    groups.get(model.providerId).models.push(model);
+  }
+
+  const providers = {};
+  for (const [id, group] of [...groups.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name))) {
+    const used = new Set();
+    const entries = {};
+    for (const model of group.models) {
+      let key = sanitizeModelKey(model.modelPart);
+      if (used.has(key)) {
+        let n = 2;
+        while (used.has(`${key}-${n}`)) n++;
+        key = `${key}-${n}`;
+      }
+      used.add(key);
+      const entry = {
+        modelID: model.id,
+        name: model.name,
+        capabilities: capabilitiesFrom(model.caps),
+      };
+      const limit = limitFor(model);
+      if (limit) entry.limit = limit;
+      entries[key] = entry;
+    }
+    providers[id] = {
+      name: group.name,
+      package: pickPackage(id, existingProviders),
+      settings: { baseURL, apiKey },
+      models: entries,
+    };
+  }
+  return providers;
+}
+
+function mergeConfig(existing, generated, state) {
+  const result = clone(existing || {});
+  const generatedIds = new Set(Object.keys(generated));
+  const previousIds = Array.isArray(state.providerIds) ? state.providerIds.map(String) : [];
+  const managedIds = new Set([...previousIds, ...generatedIds]);
+
+  if (opts.replace) {
+    result.providers = generated;
+    return { config: result, managedIds: generatedIds };
+  }
+
+  const providers = result.providers && typeof result.providers === "object" ? { ...result.providers } : {};
+  for (const id of managedIds) {
+    if (!generated[id] && !opts.keepMissing) delete providers[id];
+  }
+  for (const [id, incoming] of Object.entries(generated)) {
+    const previous = providers[id] || {};
+    const next = { ...previous, ...clone(incoming) };
+    if (previous.settings && incoming.settings) next.settings = { ...previous.settings, ...incoming.settings };
+    if (opts.keepMissing && previous.models) next.models = { ...previous.models, ...incoming.models };
+    providers[id] = next;
+  }
+  result.providers = providers;
+  if (result.provider) delete result.provider;
+  const finalIds = new Set([...managedIds].filter((id) => providers[id]));
+  return { config: result, managedIds: finalIds };
+}
+
+function countManagedModels(config, ids) {
+  let count = 0;
+  for (const id of ids) {
+    const provider = (config.providers || {})[id];
+    if (provider && provider.models) count += Object.keys(provider.models).length;
+  }
+  return count;
+}
+
+async function main() {
+  if (process.argv.includes("--help") || process.argv.includes("-h")) return printHelp();
+  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+    console.log(`sync-9router-opencode ${VERSION}`);
+    return;
+  }
+
+  opts = normalizeOptions(parseArgs(process.argv.slice(2)));
+
+  const router = normalizeRouter(opts.router || process.env.ROUTER_BASE_URL || `http://localhost:${DEFAULT_PORT}`);
+  baseURL = router.baseURL;
+  apiBase = String(opts.apiBase || process.env.ROUTER_API_BASE || router.apiBase).replace(/\/+$/, "");
+  dbPath = path.resolve(expandHome(opts.db || DEFAULTS.dbPath));
+  configPath = path.resolve(expandHome(opts.config || findConfigPath()));
+  statePath = path.join(path.dirname(configPath), STATE_BASENAME);
+  limitOverrides = readLimitOverrides(path.join(path.dirname(configPath), LIMITS_BASENAME));
+
+  apiKey = String(opts.apiKey || process.env.ROUTER_API_KEY || "").trim();
+  if (!apiKey) {
+    try { apiKey = getApiKeyFromDb() || ""; }
+    catch (err) { throw new Error(`Could not read 9router API key from ${dbPath}: ${err.message}`); }
+  }
+  if (!apiKey) throw new Error("No 9router API key found. Pass --api-key or set ROUTER_API_KEY.");
+
+  info(`Router: ${baseURL}`);
+  info(`Config: ${configPath}`);
+
+  const state = loadState();
+  const existing = loadConfig();
+  const existingProviders = existing.config.providers || {};
+
+  const [catalogRaw, nodesRaw, apiModelsRaw, availabilityRaw] = await Promise.all([
+    fetchJson(`${baseURL}${opts.modelsPath || DEFAULTS.modelsPath}`),
+    fetchJson(`${apiBase}${opts.providerNodesPath || DEFAULTS.providerNodesPath}`, 15000, false),
+    fetchJson(`${apiBase}${opts.apiModelsPath || DEFAULTS.apiModelsPath}`, 60000, false),
+    fetchJson(`${apiBase}${opts.availabilityPath || DEFAULTS.availabilityPath}`, 15000, false),
+  ]);
+
+  const catalog = catalogRaw && Array.isArray(catalogRaw.data) ? catalogRaw.data : null;
+  if (!catalog) throw new Error(`Unexpected response from ${baseURL}${opts.modelsPath || DEFAULTS.modelsPath}`);
+
+  const nodes = nodesRaw && Array.isArray(nodesRaw.nodes) ? nodesRaw.nodes : [];
+  const apiModels = apiModelsRaw && Array.isArray(apiModelsRaw.models) ? apiModelsRaw.models : [];
+  const availabilityRows = availabilityRaw && Array.isArray(availabilityRaw.models) ? availabilityRaw.models : [];
+
+  const nodeById = new Map();
+  const nodeByPrefix = new Map();
+  for (const node of nodes) {
+    if (!node || !node.id) continue;
+    nodeById.set(String(node.id), node);
+    if (node.prefix) nodeByPrefix.set(String(node.prefix).toLowerCase(), node);
+  }
+
+  const upstreamMeta = await getUpstreamModelMeta(nodes);
+  if (upstreamMeta.size) info(`Upstream metadata: ${upstreamMeta.size} model(s)`);
+
+  const existingById = new Map();
+  const prefixToExistingId = new Map();
+  for (const [id, provider] of Object.entries(existingProviders)) {
+    existingById.set(id, provider);
+    for (const model of Object.values((provider && provider.models) || {})) {
+      const modelID = model && typeof model.modelID === "string" ? model.modelID : null;
+      if (!modelID || !modelID.includes("/")) continue;
+      const prefix = modelID.slice(0, modelID.indexOf("/"));
+      if (!prefixToExistingId.has(prefix)) prefixToExistingId.set(prefix, id);
+    }
+  }
+
+  const apiInfoByRoutableId = new Map();
+  for (const entry of apiModels) {
+    if (!entry || !entry.provider) continue;
+    const node = nodeById.get(String(entry.provider));
+    const prefix = node && node.prefix ? String(node.prefix) : String(entry.provider);
+    const model = entry.model || entry.alias;
+    if (!model) continue;
+    const info = { name: entry.name, caps: entry.caps || {} };
+    const keys = [`${prefix}/${model}`];
+    for (const full of [entry.fullModel, entry.routedModel]) {
+      if (typeof full === "string" && full.includes("/")) keys.push(`${prefix}/${full.slice(full.indexOf("/") + 1)}`);
+    }
+    for (const key of [...new Set(keys)]) {
+      if (!apiInfoByRoutableId.has(key)) apiInfoByRoutableId.set(key, info);
+    }
+  }
+
+  const availabilityByModel = new Map();
+  const availabilityByProvider = new Map();
+  for (const row of availabilityRows) {
+    if (!row || !row.provider) continue;
+    const node = nodeById.get(String(row.provider));
+    const prefix = node && node.prefix ? String(node.prefix) : String(row.provider);
+    const entry = { status: row.status || "unavailable", lastError: row.lastError || "" };
+    if (row.model && row.model !== "__all") availabilityByModel.set(`${prefix}/${row.model}`, entry);
+    else {
+      if (!availabilityByProvider.has(prefix)) availabilityByProvider.set(prefix, []);
+      availabilityByProvider.get(prefix).push(entry);
+    }
+  }
+
+  const providerCache = new Map();
+  function resolveProvider(prefix) {
+    const key = String(prefix).toLowerCase();
+    if (providerCache.has(key)) return providerCache.get(key);
+    const node = nodeByPrefix.get(key);
+    const existingId = prefixToExistingId.get(String(prefix)) || prefixToExistingId.get(key);
+    const existingProvider = existingId ? existingById.get(existingId) : null;
+    const name = (node && node.name) || (existingProvider && existingProvider.name) || humanize(prefix);
+    const meta = { id: existingId || sanitizeProviderId(prefix), name, prefix: String(prefix) };
+    providerCache.set(key, meta);
+    return meta;
+  }
+
+  let models = [];
+  const unavailable = [];
+  for (const raw of catalog) {
+    const id = raw && typeof raw.id === "string" ? raw.id : null;
+    if (!id || !id.includes("/")) continue;
+    const prefix = id.slice(0, id.indexOf("/"));
+    const modelPart = id.slice(prefix.length + 1);
+    const meta = resolveProvider(prefix);
+
+    if (!providerMatches(meta, opts.provider)) continue;
+    if (opts.exclude.length && providerMatches(meta, opts.exclude)) continue;
+    if (opts.model.length && !matchesAny(id, opts.model) && !matchesAny(modelPart, opts.model)) continue;
+    if (opts.excludeModel.length && (matchesAny(id, opts.excludeModel) || matchesAny(modelPart, opts.excludeModel))) continue;
+
+    const health = availabilityByModel.get(id);
+    if (health && isPermanentError(health.lastError)) {
+      unavailable.push({ id, reason: health.lastError });
+      continue;
+    }
+
+    const apiInfo = apiInfoByRoutableId.get(id);
+    const caps = { ...(apiInfo ? apiInfo.caps : {}), ...(raw.capabilities || {}) };
+    let context =
+      caps.contextWindow != null ? caps.contextWindow :
+      apiInfo && apiInfo.caps && apiInfo.caps.contextWindow != null ? apiInfo.caps.contextWindow :
+      raw.context_length != null ? raw.context_length : raw.context_window;
+    let output =
+      caps.maxOutput != null ? caps.maxOutput :
+      apiInfo && apiInfo.caps && apiInfo.caps.maxOutput != null ? apiInfo.caps.maxOutput :
+      raw.max_completion_tokens;
+    let contextSource = "router";
+
+    const upstream = upstreamMeta.get(id);
+    if (upstream) {
+      if (upstream.context != null) {
+        context = upstream.context;
+        contextSource = "upstream";
+      }
+      if (upstream.output != null) output = upstream.output;
+    }
+
+    models.push({
+      id,
+      prefix,
+      modelPart,
+      providerId: meta.id,
+      providerName: meta.name,
+      name: chooseModelName(apiInfo, modelPart),
+      caps,
+      context,
+      output,
+      contextSource,
+    });
+  }
+
+  if (opts.limit) {
+    const counts = new Map();
+    models = models.filter((model) => {
+      const n = counts.get(model.providerId) || 0;
+      if (n >= opts.limit) return false;
+      counts.set(model.providerId, n + 1);
+      return true;
+    });
+  }
+
+  if (!models.length && !opts.allowEmpty) {
+    throw new Error("No models matched. Check provider/model filters.");
+  }
+
+  const generated = buildProviders(models, existingProviders);
+  const merged = mergeConfig(existing.config, generated, state);
+  const managedCount = countManagedModels(merged.config, merged.managedIds);
+  if (managedCount < opts.minModels && !opts.allowEmpty) {
+    throw new Error(`Only ${managedCount} model(s) would remain, below --min-models ${opts.minModels}. Nothing written.`);
+  }
+
+  if (!merged.config.$schema) merged.config.$schema = opts.schema || DEFAULTS.schema;
+
+  const changed = JSON.stringify(existing.config || {}) !== JSON.stringify(merged.config || {});
+  let backup = null;
+  if (!opts.dryRun) {
+    if (changed) {
+      if (opts.backup) backup = backupFile(configPath);
+      atomicWrite(configPath, `${JSON.stringify(merged.config, null, 2)}\n`);
+    }
+    atomicWrite(
+      statePath,
+      `${JSON.stringify(
+        {
+          version: 4,
+          format: "v2",
+          router: baseURL,
+          updatedAt: new Date().toISOString(),
+          providerIds: [...merged.managedIds],
+          models: Object.fromEntries(
+            [...merged.managedIds].map((id) => [id, Object.keys(((merged.config.providers || {})[id] || {}).models || {})])
+          ),
+        },
+        null,
+        2
+      )}\n`
+    );
+  }
+
+  const generatedIds = new Set(Object.keys(generated));
+  const providersSummary = [...merged.managedIds]
+    .filter((id) => generatedIds.has(id) && merged.config.providers[id])
+    .map((id) => ({
+      id,
+      name: merged.config.providers[id].name || id,
+      models: Object.keys(merged.config.providers[id].models || {}).length,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const limitSources = {};
+  for (const model of models) {
+    const source = contextSourceFor(model);
+    limitSources[source] = (limitSources[source] || 0) + 1;
+  }
+
+  const summary = {
+    ok: true,
+    version: VERSION,
+    router: baseURL,
+    configPath,
+    dryRun: opts.dryRun,
+    source: "9router-api",
+    providers: providersSummary,
+    limits: { sources: limitSources, upstreamModels: upstreamMeta.size },
+    unavailable,
+    wrote: !opts.dryRun && changed,
+    backup,
+  };
+
+  if (opts.json) {
+    if (opts.showContext) {
+      summary.context = models.map((m) => ({
+        id: m.id,
+        context: m.context,
+        output: m.output,
+        source: contextSourceFor(m),
+      }));
+    }
+    console.log(JSON.stringify(summary, null, 2));
+  } else {
+    if (opts.showContext) {
+      info("");
+      info("Context window:");
+      for (const m of models) {
+        info(`  ${m.id.padEnd(46)} ${String(m.context ?? "-").padStart(9)} / out ${String(m.output ?? "-").padStart(7)}  [${contextSourceFor(m)}]`);
+      }
+    }
+    info("");
+    for (const p of providersSummary) info(`  ✓ ${p.name.padEnd(24)} ${String(p.models).padStart(3)} model(s)`);
+    if (unavailable.length || opts.showUnavailable) {
+      info("");
+      info("  Dropped permanently unavailable model(s):");
+      for (const item of unavailable) info(`    ✗ ${item.id} ${String(item.reason).slice(0, 90)}`);
+    }
+    if (opts.showUnavailable) {
+      for (const [prefix, rows] of availabilityByProvider) {
+        const down = rows.filter((r) => r.status === "unavailable");
+        if (down.length) info(`  ! ${prefix}: ${down.length} unavailable connection(s)`);
+      }
+    }
+    const total = providersSummary.reduce((n, p) => n + p.models, 0);
+    info("");
+    info("Summary");
+    info(`  ${total} model(s) across ${providersSummary.length} provider(s)`);
+    if (opts.dryRun) info("  Dry-run: no files were written.");
+    else if (changed) info(`  Wrote: ${configPath}`);
+    else info("  No changes: config already up to date.");
+  }
+
+  if (!opts.dryRun && opts.reload && changed) {
+    try {
+      const out = execFileSync("opencode", ["reload"], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
+      const text = String(out || "").trim();
+      if (text) info(`\n${text}`);
+    } catch (err) {
+      warn(`Warning: 'opencode reload' failed: ${err.message}`);
+    }
+  }
+}
+
+main().catch((err) => {
+  if (opts && opts.json) console.log(JSON.stringify({ ok: false, error: err.message }, null, 2));
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});
