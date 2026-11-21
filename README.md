@@ -2,7 +2,7 @@
 
 A zero-hardcoded sync tool that turns the **9router** model catalog into an **OpenCode** provider config.
 
-Version: **4.1.0** · Node.js 18+ · MIT license
+Version: **4.2.0** · Node.js 18+ · MIT license
 
 ## Purpose
 
@@ -10,7 +10,7 @@ Version: **4.1.0** · Node.js 18+ · MIT license
 
 This script keeps the two sides aligned:
 
-> Only what 9router currently serves goes into OpenCode, and the context window is verified against the upstream provider.
+> Only what 9router currently serves **and successfully answers a live probe** goes into OpenCode. Context windows are verified against the upstream provider.
 
 ## Features
 
@@ -22,6 +22,7 @@ This script keeps the two sides aligned:
   - `GET /api/models/availability` — optional health filtering
   - `GET {baseUrl}/models` — upstream context-window verification
 - **Verified context window** — precedence: override file → upstream metadata → 9router caps.
+- **Live response probe** — every catalog model is asked to reply; non-responding, subscription-locked, and errored models are dropped.
 - **No secrets in source** — API keys are read at runtime from flags, env vars, or the local SQLite DB.
 - **Merge or replace** — `--replace` makes the config match the router exactly.
 - **Atomic writes, optional backup, optional `opencode reload`.**
@@ -91,6 +92,11 @@ See [`docs/CONFIG.md`](docs/CONFIG.md) for the override format.
 | `--no-upstream-metadata` | Skip upstream context verification |
 | `--upstream-timeout <s>` | Upstream timeout, default 20 |
 | `--show-context` | Print context window and its source |
+| `--no-probe` | Disable the live response probe |
+| `--probe-timeout <s>` | Probe timeout, default 20 |
+| `--probe-concurrency <n>` | Parallel workers, default 12 |
+| `--probe-max-tokens <n>` | Probe output budget, default 256 |
+| `--show-dropped` | List every model rejected by the probe |
 | `--dry-run` | Do not write files |
 | `--json` | Machine-readable summary |
 | `--no-reload` | Do not run `opencode reload` |

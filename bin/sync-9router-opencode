@@ -23,7 +23,7 @@ const path = require("path");
 const os = require("os");
 const { execFileSync } = require("child_process");
 
-const VERSION = "4.1.0";
+const VERSION = "4.2.0";
 const HOME = process.env.HOME || os.homedir();
 const DEFAULT_PORT = process.env.ROUTER_PORT || "20128";
 const STATE_BASENAME = ".9router-sync-state.json";
@@ -44,6 +44,9 @@ const DEFAULTS = {
     process.env.ROUTER_DB_NODES_QUERY ||
     "SELECT provider, data FROM providerConnections WHERE isActive = 1",
   upstreamTimeout: Number(process.env.ROUTER_UPSTREAM_TIMEOUT || 20),
+  probeTimeout: Number(process.env.ROUTER_PROBE_TIMEOUT || 20),
+  probeConcurrency: Number(process.env.ROUTER_PROBE_CONCURRENCY || 12),
+  probeMaxTokens: Number(process.env.ROUTER_PROBE_MAX_TOKENS || 256),
 };
 
 const OPTION_SPEC = {
@@ -84,6 +87,12 @@ const OPTION_SPEC = {
   showContext: { type: "bool", long: "show-context" },
   noUpstreamMetadata: { type: "bool", long: "no-upstream-metadata" },
   upstreamTimeout: { type: "number", long: "upstream-timeout" },
+  probe: { type: "bool" },
+  noProbe: { type: "bool", long: "no-probe" },
+  probeTimeout: { type: "number", long: "probe-timeout" },
+  probeConcurrency: { type: "number", long: "probe-concurrency" },
+  probeMaxTokens: { type: "number", long: "probe-max-tokens" },
+  showDropped: { type: "bool", long: "show-dropped" },
 };
 
 let opts = {};
@@ -103,6 +112,7 @@ function printHelp() {
       `sync-9router-opencode v${VERSION}`,
       "",
       "Generic 9router -> OpenCode config sync. No hardcoded providers or models.",
+      "Only models that actually respond to a probe are written (use --no-probe to disable).",
       "",
       "USAGE",
       "  sync-9router-opencode [options]",
@@ -122,6 +132,15 @@ function printHelp() {
       "      --no-upstream-metadata",
       "                           Do not read /models from upstream providers",
       "      --upstream-timeout <s> Upstream metadata timeout (default 20)",
+      "",
+      "PROBE",
+      "      --no-probe            Register every catalog model without testing",
+      "      --probe-timeout <s>   Per-request probe timeout (default 20)",
+      "      --probe-concurrency <n>",
+      "                           Parallel probe workers (default 12)",
+      "      --probe-max-tokens <n>",
+      "                           Output tokens for the probe (default 256)",
+      "      --show-dropped        List every model rejected by the probe",
       "      --package <name>     OpenCode provider package",
       "      --schema <url>       OpenCode config $schema",
       "      --models-path <path> Override /v1/models path",
@@ -240,6 +259,13 @@ function normalizeOptions(raw) {
   o.allowEmpty = !!o.allowEmpty;
   o.showUnavailable = !!o.showUnavailable;
   o.showContext = !!o.showContext;
+  o.showDropped = !!o.showDropped;
+  o.probe = !o.noProbe && o.probe !== false;
+  const positive = (value, fallback) =>
+    value != null && Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : fallback;
+  o.probeTimeout = positive(o.probeTimeout, DEFAULTS.probeTimeout);
+  o.probeConcurrency = positive(o.probeConcurrency, DEFAULTS.probeConcurrency);
+  o.probeMaxTokens = positive(o.probeMaxTokens, DEFAULTS.probeMaxTokens);
   o.noUpstreamMetadata = !!o.noUpstreamMetadata;
   o.upstreamTimeout =
     o.upstreamTimeout != null && Number.isFinite(o.upstreamTimeout)
@@ -773,6 +799,100 @@ function countManagedModels(config, ids) {
   return count;
 }
 
+
+function extractContent(json) {
+  const choices = json && Array.isArray(json.choices) ? json.choices : [];
+  const first = choices[0] || {};
+  const message = first.message || {};
+  let content = message.content;
+  if (Array.isArray(content)) content = content.map((part) => (part && part.text) || "").join("");
+  if (typeof content !== "string") return "";
+  return content.trim();
+}
+
+function probeReason(status, json, raw, err) {
+  if (err) return err.name === "TimeoutError" ? "timeout" : String(err.message || err).slice(0, 120);
+  if (!json) return `HTTP ${status} ${String(raw || "").replace(/\s+/g, " ").slice(0, 100)}`;
+  const msg = json.error && (json.error.message || json.error.type) || json.message;
+  return `HTTP ${status}${msg ? " " + String(msg).replace(/\s+/g, " ").slice(0, 100) : ""}`;
+}
+
+async function probeOne(model) {
+  const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+  const attempt = async (maxTokens) => {
+    const started = Date.now();
+    const body = JSON.stringify({
+      model: model.id,
+      messages: [{ role: "user", content: "Reply exactly PONG" }],
+      max_tokens: maxTokens,
+      temperature: 0,
+      stream: false,
+    });
+    let status = 0;
+    let raw = "";
+    let json = null;
+    try {
+      const res = await fetch(`${baseURL}/chat/completions`, {
+        method: "POST",
+        headers,
+        body,
+        signal: AbortSignal.timeout(opts.probeTimeout * 1000),
+      });
+      status = res.status;
+      raw = await res.text();
+      try { json = raw ? JSON.parse(raw) : null; } catch (_) {}
+    } catch (err) {
+      return { ok: false, reason: probeReason(0, null, "", err), ms: Date.now() - started };
+    }
+
+    if (status < 200 || status >= 300) {
+      return { ok: false, reason: probeReason(status, json, raw), ms: Date.now() - started };
+    }
+    const content = extractContent(json);
+    if (content) {
+      return { ok: true, content: content.slice(0, 80), ms: Date.now() - started };
+    }
+    const finish = json && json.choices && json.choices[0] && json.choices[0].finish_reason;
+    return {
+      ok: false,
+      empty: finish === "length",
+      reason: "empty response" + (finish ? ` (finish_reason=${finish})` : ""),
+      ms: Date.now() - started,
+    };
+  };
+
+  let result = await attempt(opts.probeMaxTokens);
+  if (result.ok) return result;
+  const retryable = result.empty || /429|50[0-9]|timeout|fetch failed|network/i.test(result.reason);
+  if (retryable) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    result = await attempt(Math.max(512, opts.probeMaxTokens * 3));
+  }
+  return result;
+}
+
+async function probeModels(models) {
+  const results = new Array(models.length);
+  let cursor = 0;
+  const workers = Math.max(1, Math.min(opts.probeConcurrency, models.length));
+  await Promise.all(
+    Array.from({ length: workers }, async () => {
+      while (cursor < models.length) {
+        const index = cursor++;
+        results[index] = await probeOne(models[index]);
+      }
+    })
+  );
+  const passed = [];
+  const dropped = [];
+  models.forEach((model, index) => {
+    const result = results[index] || { ok: false, reason: "no result" };
+    if (result.ok) passed.push(model);
+    else dropped.push({ id: model.id, reason: result.reason, ms: result.ms });
+  });
+  return { passed, dropped };
+}
+
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) return printHelp();
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
@@ -954,6 +1074,18 @@ async function main() {
     throw new Error("No models matched. Check provider/model filters.");
   }
 
+  let probeResult = null;
+  if (opts.probe) {
+    const before = models.length;
+    info(`Probing ${before} model(s) with ${opts.probeConcurrency} worker(s)...`);
+    probeResult = await probeModels(models);
+    models = probeResult.passed;
+    verbose(`Probe kept ${models.length}/${before}, dropped ${probeResult.dropped.length}`);
+    if (!models.length && !opts.allowEmpty) {
+      throw new Error("No models responded to the live probe. Nothing written.");
+    }
+  }
+
   const generated = buildProviders(models, existingProviders);
   const merged = mergeConfig(existing.config, generated, state);
   const managedCount = countManagedModels(merged.config, merged.managedIds);
@@ -1014,6 +1146,15 @@ async function main() {
     source: "9router-api",
     providers: providersSummary,
     limits: { sources: limitSources, upstreamModels: upstreamMeta.size },
+    probe: probeResult
+      ? {
+          enabled: true,
+          tested: models.length + probeResult.dropped.length,
+          passed: models.length,
+          dropped: probeResult.dropped.length,
+          details: probeResult.dropped,
+        }
+      : { enabled: false },
     unavailable,
     wrote: !opts.dryRun && changed,
     backup,
@@ -1035,6 +1176,17 @@ async function main() {
       info("Context window:");
       for (const m of models) {
         info(`  ${m.id.padEnd(46)} ${String(m.context ?? "-").padStart(9)} / out ${String(m.output ?? "-").padStart(7)}  [${contextSourceFor(m)}]`);
+      }
+    }
+    if (probeResult) {
+      info("");
+      info(`Probe: ${models.length}/${models.length + probeResult.dropped.length} model(s) responded, ${probeResult.dropped.length} dropped`);
+      const limit = opts.showDropped ? probeResult.dropped.length : Math.min(20, probeResult.dropped.length);
+      for (const item of probeResult.dropped.slice(0, limit)) {
+        info(`  ✗ ${item.id} — ${item.reason}`);
+      }
+      if (!opts.showDropped && probeResult.dropped.length > limit) {
+        info(`  ... and ${probeResult.dropped.length - limit} more (use --show-dropped)`);
       }
     }
     info("");

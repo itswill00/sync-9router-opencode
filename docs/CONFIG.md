@@ -23,6 +23,9 @@ All of these can be changed with CLI flags or environment variables.
 | `ROUTER_DB_KEY_QUERY` | SQL query for the router key |
 | `ROUTER_DB_NODES_QUERY` | SQL query for provider connection keys |
 | `ROUTER_UPSTREAM_TIMEOUT` | Upstream metadata timeout in seconds |
+| `ROUTER_PROBE_TIMEOUT` | Live probe timeout in seconds |
+| `ROUTER_PROBE_CONCURRENCY` | Parallel probe workers |
+| `ROUTER_PROBE_MAX_TOKENS` | Output token budget for the probe |
 | `ROUTER_MODELS_PATH` | Override `/v1/models` |
 | `ROUTER_API_MODELS_PATH` | Override `/api/models` |
 | `ROUTER_PROVIDER_NODES_PATH` | Override `/api/provider-nodes` |
