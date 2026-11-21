@@ -2,7 +2,7 @@
 
 A zero-hardcoded sync tool that turns the **9router** model catalog into an **OpenCode** provider config.
 
-Version: **4.2.0** · Node.js 18+ · MIT license
+Version: **4.2.1** · Node.js 18+ · MIT license
 
 ## Purpose
 
@@ -97,6 +97,7 @@ See [`docs/CONFIG.md`](docs/CONFIG.md) for the override format.
 | `--probe-concurrency <n>` | Parallel workers, default 12 |
 | `--probe-max-tokens <n>` | Probe output budget, default 256 |
 | `--show-dropped` | List every model rejected by the probe |
+| `--probe-skip <list>` | Trust matching providers without probing |
 | `--dry-run` | Do not write files |
 | `--json` | Machine-readable summary |
 | `--no-reload` | Do not run `opencode reload` |

@@ -23,7 +23,7 @@ const path = require("path");
 const os = require("os");
 const { execFileSync } = require("child_process");
 
-const VERSION = "4.2.0";
+const VERSION = "4.2.1";
 const HOME = process.env.HOME || os.homedir();
 const DEFAULT_PORT = process.env.ROUTER_PORT || "20128";
 const STATE_BASENAME = ".9router-sync-state.json";
@@ -93,6 +93,7 @@ const OPTION_SPEC = {
   probeConcurrency: { type: "number", long: "probe-concurrency" },
   probeMaxTokens: { type: "number", long: "probe-max-tokens" },
   showDropped: { type: "bool", long: "show-dropped" },
+  probeSkip: { type: "list", long: "probe-skip" },
 };
 
 let opts = {};
@@ -141,6 +142,7 @@ function printHelp() {
       "      --probe-max-tokens <n>",
       "                           Output tokens for the probe (default 256)",
       "      --show-dropped        List every model rejected by the probe",
+      "      --probe-skip <list>   Trust matching providers without probing",
       "      --package <name>     OpenCode provider package",
       "      --schema <url>       OpenCode config $schema",
       "      --models-path <path> Override /v1/models path",
@@ -242,7 +244,7 @@ function parseArgs(argv) {
 
 function normalizeOptions(raw) {
   const o = { ...raw };
-  for (const key of ["provider", "exclude", "model", "excludeModel"]) {
+  for (const key of ["provider", "exclude", "model", "excludeModel", "probeSkip"]) {
     if (!Array.isArray(o[key])) o[key] = [];
   }
   o.dryRun = !!o.dryRun;
@@ -1076,11 +1078,18 @@ async function main() {
 
   let probeResult = null;
   if (opts.probe) {
-    const before = models.length;
-    info(`Probing ${before} model(s) with ${opts.probeConcurrency} worker(s)...`);
-    probeResult = await probeModels(models);
-    models = probeResult.passed;
-    verbose(`Probe kept ${models.length}/${before}, dropped ${probeResult.dropped.length}`);
+    const shouldProbe = (model) =>
+      !opts.probeSkip.length ||
+      !providerMatches({ id: model.providerId, prefix: model.prefix, name: model.providerName }, opts.probeSkip);
+    const skipped = models.filter((model) => !shouldProbe(model));
+    const targets = models.filter(shouldProbe);
+    info(`Probing ${targets.length} model(s) with ${opts.probeConcurrency} worker(s)${skipped.length ? `, trusting ${skipped.length} skipped` : ""}...`);
+    probeResult = await probeModels(targets);
+    if (skipped.length) {
+      verbose(`Trusted ${skipped.length} skipped model(s) without probing`);
+    }
+    models = [...skipped, ...probeResult.passed];
+    verbose(`Probe kept ${probeResult.passed.length}/${targets.length}, dropped ${probeResult.dropped.length}`);
     if (!models.length && !opts.allowEmpty) {
       throw new Error("No models responded to the live probe. Nothing written.");
     }
@@ -1152,6 +1161,7 @@ async function main() {
           tested: models.length + probeResult.dropped.length,
           passed: models.length,
           dropped: probeResult.dropped.length,
+          skipped: models.filter((m) => opts.probeSkip.length && providerMatches({ id: m.providerId, prefix: m.prefix, name: m.providerName }, opts.probeSkip)).length,
           details: probeResult.dropped,
         }
       : { enabled: false },
@@ -1180,7 +1190,8 @@ async function main() {
     }
     if (probeResult) {
       info("");
-      info(`Probe: ${models.length}/${models.length + probeResult.dropped.length} model(s) responded, ${probeResult.dropped.length} dropped`);
+      const tested = models.length + probeResult.dropped.length;
+      info(`Probe: ${probeResult.passed.length}/${probeResult.passed.length + probeResult.dropped.length} tested model(s) responded, ${probeResult.dropped.length} dropped${probeResult.skipped ? `, ${probeResult.skipped} trusted without probing` : ""}`);
       const limit = opts.showDropped ? probeResult.dropped.length : Math.min(20, probeResult.dropped.length);
       for (const item of probeResult.dropped.slice(0, limit)) {
         info(`  ✗ ${item.id} — ${item.reason}`);

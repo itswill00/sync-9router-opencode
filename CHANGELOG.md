@@ -1,6 +1,11 @@
-## 4.2.0
+# Changelog
 
-- Added a live response probe. By default, only models that return a non-empty chat response are written.
+## 4.2.1
+
+- Added `--probe-skip` to trust already-verified providers without spending another probe request.
+- Probe summary now reports the number of trusted (skipped) models.
+
+dded a live response probe. By default, only models that return a non-empty chat response are written.
 - Dropped models are reported in JSON (`probe.details`) and with `--show-dropped` in text output.
 - Added `--no-probe`, `--probe-timeout`, `--probe-concurrency`, and `--probe-max-tokens`.
 - A short second attempt with a larger token budget is used for empty reasoning responses and transient errors.
