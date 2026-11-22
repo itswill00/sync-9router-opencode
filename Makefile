@@ -14,4 +14,4 @@ install: check
 	@echo "Installed to $(PREFIX)/bin/sync-9router-opencode"
 
 clean:
-	rm -f opencode.json.bak-* .9router-sync-state.json
+	rm -f .9router-sync-cache.json .9router-sync-state.json

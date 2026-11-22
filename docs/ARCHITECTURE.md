@@ -3,57 +3,98 @@
 ## Data flow
 
 ```text
-9router /v1/models --------------> routable catalog (source of truth)
-9router /api/models -------------> names, capabilities, limits
-9router /api/provider-nodes -----> prefix, baseUrl, node id
-9router /api/models/availability -> connection health (optional)
-provider {baseUrl}/models -------> upstream context window (optional)
-local 9router DB ----------------> connection keys (runtime only)
-                 |
-                 v
-        model objects: id, providerId, name, caps, limit, contextSource
-                 |
-                 v
-        provider map -> merge or replace -> opencode.json
-                 |
-                 v
-        .9router-sync-state.json + opencode reload
+9router
+  GET /v1/models              routable catalog (id, caps, router limits)
+  GET /api/provider-nodes      node id -> prefix, name, baseUrl
+  SQLite providerConnections   node id -> upstream API key
+  GET {node.baseUrl}/models    upstream context/output metadata
+
+OpenCode
+  opencode.json                providers -> models
+  .9router-sync-state.json     managed provider ids + prefixes
+  .9router-sync-cache.json     probe results, upstream metadata, catalog
+  .9router-sync-limits.json    user overrides
 ```
 
-## No hardcoded identities
+Nothing provider-specific is compiled into the script. The only implied contract is 9router's own URL shape, and even those paths are overridable.
 
-The script contains no provider list, prefix list, alias list, or model list. Names come from:
+## Main phases
 
-- `node.name` or `providerSpecificData.prefix` for custom nodes
-- the existing `provider.name` for built-in providers
-- `humanize(prefix)` as a last resort
+### 1. Discovery
 
-Provider IDs are not guessed either. The script builds a `prefix -> providerId` map from `modelID` values already present in the config. This is why `oc` can stay `opencode` and `mmf` can stay `mimo-free` without any special case in code.
+`/v1/models` is the catalog. Every ID is `prefix/model`; the prefix identifies the 9router node. `/api/provider-nodes` and the provider-connection table are read once, in parallel, to resolve prefix → name/baseUrl/key.
 
-## Merge strategy
+### 2. Provider resolution
 
-- `--replace`: `config.providers = generated`
-- default:
-  - remove previously managed providers that disappeared upstream, unless `--keep-missing`
-  - merge old and new models
-  - preserve other top-level keys such as `mcp`, `compaction`, `model`, and `$schema`
-  - merge old and new `settings`
+OpenCode provider IDs are *not* derived from 9router naming conventions, because real configs contain renamed providers (for example `oc` for OpenCode Free). Instead:
 
-State is written to `.9router-sync-state.json` next to `opencode.json`.
+1. Build `prefix → providerId` from the models already present in `opencode.json`.
+2. Fall back to the node prefix, then to a sanitized id.
+3. If the resulting id would collide with an unmanaged provider, pick `<id>-router` (never overwrite user-owned providers).
 
-## Limit resolution
+This is what keeps `--provider` filters and existing customizations stable across runs.
+
+### 3. Limits
 
 For each model:
 
-1. Read caps from `/api/models` and `/v1/models`.
-2. If the node exposes upstream model metadata, use its context/output fields.
-3. If `.9router-sync-limits.json` has an entry for the full `modelID`, that entry wins.
-4. Write `limit.context` and `limit.output` into the OpenCode config.
+```text
+context = override.context || upstream.context || router.context
+output  = override.output  || upstream.output  || router.output
+```
 
-The winning source is recorded in `contextSource` and aggregated in JSON as `limits.sources`.
+Upstream metadata is fetched per node, concurrency-limited, and cached with a fingerprint of `baseUrl + key hash`. A stale cache is still used if the node is temporarily unreachable, so a slow provider never causes context windows to collapse to the router's lower caps.
 
-## Filtering and safety
+### 4. Probing
 
-Filters are applied before provider construction. Models reported with a permanent upstream error by `/api/models/availability` are dropped and listed under `unavailable` in the summary.
+Each selected model gets a minimal chat request (`Reply exactly: PONG`).
 
-All writes use an atomic temporary-file rename, with an optional backup before the first change.
+- If the provider rejects the request shape (`temperature`, `max_tokens`), the probe retries with a minimal body.
+- Reasoning models that hit `finish_reason=length` retry with a larger budget.
+- `429`/`5xx`/timeouts retry once with a short delay.
+
+Failures are classified:
+
+| Class | Signal | Meaning |
+|---|---|---|
+| `permanent` | `400/402/403/404/410/413/422`, "not found", "unavailable", "insufficient", "free tier"… | Cannot work; safe to remove |
+| `transient` | timeout, `429`, `5xx`, empty, network | Might work later; never remove an existing model |
+| `ok` | non-empty content | Keep |
+
+Probe results are cached per model with a fingerprint of router URL, provider key hash, model id and capabilities, so a key rotation or capability change invalidates the entry automatically.
+
+### 5. Adaptive rate limiting
+
+Probing 200+ models at once triggers provider rate limits, which would produce false "transient" results. The probe therefore enforces:
+
+- a global semaphore (`ROUTER_PROBE_CONCURRENCY`, default 16);
+- a per-provider limiter (default 3) that halves its concurrency and applies exponential cooldown when it sees `429`/rate-limit text;
+- gradual recovery after successful requests.
+
+## Merging
+
+`--provider` and `--model` filters are applied *before* probing and again during merge:
+
+- A provider not matched by `--provider` is never modified.
+- A model not matched by `--model` is never removed.
+- Managed providers missing from the catalog are kept when their 9router node still exists and not every remaining model failed permanently. This prevents a temporary node outage from deleting a provider.
+- Unmanaged providers are never touched.
+
+Merge result is written atomically with a timestamped backup. `opencode reload` runs only when the serialized config changed.
+
+## State vs cache
+
+- **State** is semantic: which providers this tool owns and their prefixes. It survives cache deletion.
+- **Cache** is disposable: probe results, upstream metadata, and the last catalog. Deleting it only means slower next run.
+
+If state is lost, managed providers are re-derived from `baseURL` matching the configured router.
+
+## Why failures are split
+
+A single "delete everything that fails" rule is catastrophic for real use:
+
+- Providers rate-limit large probe batches.
+- Some models are temporarily overloaded.
+- Some setups have a local shim that is down for a minute.
+
+Splitting permanent from transient keeps the catalog honest without destroying a working configuration.

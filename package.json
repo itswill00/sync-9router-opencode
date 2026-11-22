@@ -1,7 +1,7 @@
 {
   "name": "sync-9router-opencode",
-  "version": "4.1.0",
-  "description": "Zero-hardcoded 9router to OpenCode config sync with verified context windows",
+  "version": "5.0.0",
+  "description": "Zero-hardcoded 9router to OpenCode config sync with cached live probing",
   "type": "commonjs",
   "bin": {
     "sync-9router-opencode": "bin/sync-9router-opencode"
@@ -19,7 +19,8 @@
     "opencode",
     "ai-gateway",
     "model-sync",
-    "context-window"
+    "context-window",
+    "probe"
   ],
   "license": "MIT",
   "repository": {

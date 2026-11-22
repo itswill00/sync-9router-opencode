@@ -1,38 +1,39 @@
 # Security
 
-## No secrets in the repository
+## Credential sources
 
-This script deliberately stores no API keys, tokens, cookies, or credentials. All credentials are read at runtime.
+The tool never embeds secrets. The router key comes from:
 
-Router key lookup order:
+1. `ROUTER_API_KEY`
+2. the 9router SQLite database (`apiKeys` table, read-only)
 
-1. `--api-key <key>`
-2. `ROUTER_API_KEY`
-3. SQL query from `--db-key-query` / `ROUTER_DB_KEY_QUERY` against the local SQLite DB
+Provider keys are read from `providerConnections` only to query upstream `/models` for context metadata. They are never printed, written to the repo, or included in `--json` output.
 
-For upstream metadata, the script reads `apiKey` from provider connection rows in the same local DB. No key is written to `opencode.json`, the state file, logs, or `--json` output.
+## What is written to disk
 
-## Avoid
+| File | Secrets? |
+|---|---|
+| `opencode.json` | Yes — router API key inside provider `settings`, as OpenCode requires |
+| `.9router-sync-state.json` | No |
+| `.9router-sync-cache.json` | No keys; fingerprints are truncated SHA-256 hashes |
+| backups | Same contents as `opencode.json` |
 
-- Do not paste raw keys in issues, README files, or chat logs.
-- Do not commit `opencode.json`, `.9router-sync-state.json`, or `*.bak-*` backups.
-- Do not commit a limit-override file if its model IDs are sensitive in your setup.
+All written files use mode `0600`, and writes are atomic (temp file + rename) so an interrupted run cannot leave a half-written config.
 
-## Rotation
+## Fingerprints
 
-If a key was ever exposed in chat, logs, or screenshots, rotate it in the provider dashboard. Then remove the old connection in 9router and add a new one.
+Probe and metadata cache entries are keyed by a truncated SHA-256 of router URL, provider key hash, model ID and capabilities. Rotating a key invalidates relevant cache entries without ever storing the key itself.
 
-## File permissions
+## SQLite access
 
-Config writes use mode `0600` and atomic rename. Backups are also created with mode `0600`.
+- Read-only connection.
+- Only two queries are used: the router key and provider connection keys.
+- Both queries are overridable via `ROUTER_DB_KEY_QUERY` / `ROUTER_DB_NODES_QUERY` for unusual schemas.
 
-## Reporting issues
+## Backups
 
-Include:
+Every config change writes `opencode.json.bak-<timestamp>` with mode `0600`. Backups contain provider keys, so treat the config directory as sensitive and prune old backups.
 
-- `sync-9router-opencode --version`
-- Node version
-- 9router and OpenCode versions
-- Output of `sync-9router-opencode --dry-run --json --show-context`
+## Reporting
 
-Never include API keys, cookies, or raw DB dumps.
+Do not paste raw `--json` output publicly without checking it: it includes model IDs, error messages and provider names. It never includes API keys.

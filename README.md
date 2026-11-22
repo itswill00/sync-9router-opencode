@@ -1,121 +1,116 @@
 # sync-9router-opencode
 
-A zero-hardcoded sync tool that turns the **9router** model catalog into an **OpenCode** provider config.
+Sync the **9router** model catalog into an **OpenCode** provider config — fast, safe, and only with models that actually answer.
 
-Version: **4.2.1** · Node.js 18+ · MIT license
+Version **5.0.0** · Node.js 18+ · MIT
 
-## Purpose
+## Why
 
-9router exposes many chat providers through one OpenAI-compatible endpoint. OpenCode needs an explicit provider/model map before those models can be selected. Doing that map by hand is fragile: new models never appear, dead models stay forever, and context windows are often wrong because 9router can override upstream metadata.
+9router aggregates many providers behind one OpenAI-compatible endpoint. OpenCode needs an explicit provider/model map. Doing that by hand breaks constantly: new models never appear, dead models stay forever, context windows drift, and providers that start returning `402`/`404` keep showing up in the picker.
 
-This script keeps the two sides aligned:
+This tool keeps both sides aligned:
 
-> Only what 9router currently serves **and successfully answers a live probe** goes into OpenCode. Context windows are verified against the upstream provider.
+> Only models that 9router currently serves **and** that answer a live probe are written. Models already in your config are kept when a failure looks temporary (timeout, `429`, `5xx`) and dropped when it looks permanent (`402`, `404`, `410`, "model unavailable").
 
 ## Features
 
-- **Zero hardcoded providers, prefixes, aliases, or model IDs.** Every name comes from the running router.
-- **Multiple sources of truth**
-  - `GET /v1/models` — routable catalog
-  - `GET /api/models` — display names, capabilities, limits
-  - `GET /api/provider-nodes` — custom node prefix/baseUrl
-  - `GET /api/models/availability` — optional health filtering
-  - `GET {baseUrl}/models` — upstream context-window verification
-- **Verified context window** — precedence: override file → upstream metadata → 9router caps.
-- **Live response probe** — every catalog model is asked to reply; non-responding, subscription-locked, and errored models are dropped.
-- **No secrets in source** — API keys are read at runtime from flags, env vars, or the local SQLite DB.
-- **Merge or replace** — `--replace` makes the config match the router exactly.
-- **Atomic writes, optional backup, optional `opencode reload`.**
-- **JSON output** with `--json` and `--show-context`.
+- **Zero hardcoded providers, prefixes, aliases, or model IDs.** Everything is discovered at runtime.
+- **Cache-backed probing.** Results are reused for 12 hours, so routine runs take ~4 seconds instead of a minute.
+- **Smart failure handling.** Permanent failures are removed; transient ones never nuke a working setup.
+- **Adaptive rate limiting.** When a provider answers `429`, the probe slows that provider down instead of hammering it.
+- **Upstream context verification.** `override → upstream /models → 9router` precedence, cached for 12 hours.
+- **Filter-safe merging.** `--provider`/`--model` only touch what they match; other providers and stale entries are preserved.
+- **Stable model keys and names.** Existing OpenCode keys/names are reused so your own edits are not overwritten.
+- **Safe writes.** Atomic write, timestamped backup, and `opencode reload` only when the config actually changes.
+- **No secrets in the repo.** The router key is read from env or the local SQLite DB at runtime.
 
 ## Install
 
 ```bash
 git clone https://github.com/itswill00/sync-9router-opencode.git
 cd sync-9router-opencode
-make install
+make install                 # /usr/local/bin
+make install PREFIX="$PREFIX" # Termux
 ```
 
-On Termux, set the prefix first:
+## Usage
 
 ```bash
-make install PREFIX="$PREFIX"
+sync-9router-opencode                      # sync everything, with live probe
+sync-9router-opencode --dry-run            # probe and report, write nothing
+sync-9router-opencode --provider numes     # only that provider
+sync-9router-opencode --refresh            # ignore caches, re-check everything
+sync-9router-opencode --json               # full machine-readable report
 ```
 
-The `install` target copies `bin/sync-9router-opencode` to `$PREFIX/bin/` with mode `0755`.
+That is the whole interface. Only ten flags exist, and six of them are rarely needed.
 
-## Quick start
+| Flag | Purpose |
+|---|---|
+| `-n, --dry-run` | Build and probe without writing |
+| `--config <path>` | OpenCode config path |
+| `--router <url>` | 9router URL (default `http://localhost:20128`) |
+| `--provider <list>` | Limit to matching providers |
+| `--model <glob>` | Limit to matching model IDs |
+| `--no-probe` | Trust the catalog without testing |
+| `--refresh` | Bypass caches for this run |
+| `--json` | Machine-readable output |
+| `--quiet` | Errors and warnings only |
+| `--verbose` | Explain cache/probe/metadata decisions |
 
-```bash
-# Preview changes
-sync-9router-opencode --dry-run
-
-# Make OpenCode match 9router exactly
-sync-9router-opencode --replace
-
-# Show where every context window came from
-sync-9router-opencode --dry-run --show-context
-
-# Machine-readable output
-sync-9router-opencode --json --show-context
-```
-
-Example `--show-context` output:
+## How a run works
 
 ```text
-centai/hy4-flash:free                       1048576 / out  64000  [upstream]
-centai/deepseek-v4.1-flash                  1000000 / out 384000  [router]
+9router /v1/models ─┐
+/api/provider-nodes ├─► provider resolution ─► probe (cached) ─► merge ─► opencode.json
+provider DB keys    ─┘                              ▲
+                          probe cache ──────────────┘
 ```
 
-## Context-window precedence
+1. Catalog and nodes are read from 9router.
+2. Each catalog ID is mapped to an OpenCode provider ID using the existing config's `prefix → providerId` map, so your IDs (`oc`, `mmf`, …) stay stable.
+3. Models are probed through the router. Success is cached; failures are classified as permanent or transient.
+4. The config is merged per provider, preserving unmanaged providers, stable keys, custom names and settings.
 
-| Priority | Source | Controlled by |
+## Failure classification
+
+| Kind | Examples | Effect on an existing model |
 |---|---|---|
-| 1 | User override file | `.9router-sync-limits.json` |
-| 2 | Upstream provider | `GET {baseUrl}/models` |
-| 3 | 9router | `/api/models` + `/v1/models` |
+| Permanent | `402` paid tier, `404`, `410`, "model unavailable", `ModelProtocolUnsupported` | Removed |
+| Transient | timeout, `429`, `5xx`, empty response | Kept unchanged |
+| New model that fails | any failure | Not added |
 
-Generic field names are recognized for context (`context_window`, `contextWindow`, `context_length`, `context`) and output (`max_output_tokens`, `maxOutputTokens`, `max_output`, `max_completion_tokens`).
+This is why a sync never leaves you with an empty provider after a bad day upstream.
 
-See [`docs/CONFIG.md`](docs/CONFIG.md) for the override format.
+## Context windows
 
-## Important options
-
-| Option | Description |
+| Priority | Source |
 |---|---|
-| `--router <url>` | 9router URL, default `http://localhost:20128` |
-| `--config <path>` | Path to `opencode.json` |
-| `--api-key <key>` | Router API key; otherwise read from DB |
-| `--replace` | Replace the whole provider map |
-| `--keep-missing` / `--prune-missing` | Keep or drop managed models missing upstream |
-| `--provider <list>` / `--model <glob>` | Filters |
-| `--no-upstream-metadata` | Skip upstream context verification |
-| `--upstream-timeout <s>` | Upstream timeout, default 20 |
-| `--show-context` | Print context window and its source |
-| `--no-probe` | Disable the live response probe |
-| `--probe-timeout <s>` | Probe timeout, default 20 |
-| `--probe-concurrency <n>` | Parallel workers, default 12 |
-| `--probe-max-tokens <n>` | Probe output budget, default 256 |
-| `--show-dropped` | List every model rejected by the probe |
-| `--probe-skip <list>` | Trust matching providers without probing |
-| `--dry-run` | Do not write files |
-| `--json` | Machine-readable summary |
-| `--no-reload` | Do not run `opencode reload` |
+| 1 | `.9router-sync-limits.json` override |
+| 2 | Upstream `GET {baseUrl}/models` |
+| 3 | 9router caps |
 
-Run `sync-9router-opencode --help` for the full list.
+Upstream lookups are cached per provider keyed by base URL + key hash, so a routine run does not re-download large catalogs. Context sources are always reported in `--json` under `limits`.
+
+## Caches and state
+
+| File | Contents |
+|---|---|
+| `.9router-sync-state.json` | Which providers this tool manages, plus prefixes |
+| `.9router-sync-cache.json` | Probe results, upstream metadata, last catalog |
+| `.9router-sync-limits.json` | Your context/output overrides |
+
+Delete the cache file to force a cold probe, or use `--refresh` for a single run.
 
 ## Repository layout
 
 ```text
-bin/sync-9router-opencode   # executable script
-docs/ARCHITECTURE.md        # data flow and merge strategy
-docs/CONFIG.md              # paths, env vars, limit overrides
+bin/sync-9router-opencode   # executable
+docs/ARCHITECTURE.md        # data flow, merging, failure model
+docs/CONFIG.md              # paths, env tuning, overrides
 docs/SECURITY.md            # credential handling
-examples/limits.json        # sample context-window override
+examples/limits.json
 CHANGELOG.md
-LICENSE
-Makefile
-package.json
 ```
 
 ## License

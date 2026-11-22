@@ -2,51 +2,67 @@
 "use strict";
 
 /*
- * sync-9router-opencode
+ * sync-9router-opencode v5
  *
  * Generic 9router -> OpenCode config sync.
  *
- * Design rules:
- *  - No provider ids, prefixes, names, model ids or model allowlists are
- *    hardcoded. Everything comes from the running 9router instance.
- *  - The live router catalog (/v1/models) is the source of truth.
- *  - /api/provider-nodes supplies custom provider names and node id -> prefix.
- *  - /api/models supplies human model names, capabilities and limits.
- *  - /api/models/availability is optional and only used to report/downrank
- *    permanently unavailable entries.
- *  - Existing OpenCode config is only used to preserve provider ids/names and
- *    non-managed settings, never to decide which models exist.
+ * Principles:
+ *  - No hardcoded provider ids, prefixes, names, model ids or allowlists.
+ *  - 9router is the catalog source. Existing OpenCode config is only used to
+ *    preserve provider ids, names, package, stable model keys and custom names.
+ *  - A model is written only after it answers a live probe (unless --no-probe).
+ *  - Probe results and upstream metadata are cached, so routine syncs are fast.
+ *  - Filters never touch providers/models outside their scope.
+ *
+ * Advanced tuning is intentionally environment-based, not a pile of CLI flags:
+ *   ROUTER_BASE_URL, ROUTER_API_BASE, ROUTER_API_KEY, ROUTER_DB_PATH
+ *   ROUTER_PROBE_TIMEOUT, ROUTER_PROBE_CONCURRENCY, ROUTER_PROBE_PER_PROVIDER
+ *   ROUTER_PROBE_MAX_TOKENS, ROUTER_PROBE_TTL, ROUTER_FAIL_TTL
+ *   ROUTER_METADATA_TTL, ROUTER_UPSTREAM_TIMEOUT
+ *   ROUTER_NO_UPSTREAM=1, ROUTER_API_MODELS=1, ROUTER_NO_CACHE=1
+ *   ROUTER_AVAILABILITY=1, ROUTER_DEBUG=1
  */
 
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { execFileSync } = require("child_process");
 
-const VERSION = "4.2.1";
+const VERSION = "5.0.0";
 const HOME = process.env.HOME || os.homedir();
-const DEFAULT_PORT = process.env.ROUTER_PORT || "20128";
 const STATE_BASENAME = ".9router-sync-state.json";
+const CACHE_BASENAME = ".9router-sync-cache.json";
 const LIMITS_BASENAME = ".9router-sync-limits.json";
+
+const envNum = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+const envBool = (name, fallback = false) => {
+  const v = process.env[name];
+  if (v == null) return fallback;
+  return /^(1|true|yes|on)$/i.test(String(v));
+};
 
 const DEFAULTS = {
   package: process.env.OPENCODE_COMPATIBLE_PACKAGE || "@opencode/ai/providers/openai-compatible",
   schema: process.env.OPENCODE_SCHEMA || "https://opencode.ai/config.json",
-  modelsPath: process.env.ROUTER_MODELS_PATH || "/v1/models",
-  apiModelsPath: process.env.ROUTER_API_MODELS_PATH || "/api/models",
-  providerNodesPath: process.env.ROUTER_PROVIDER_NODES_PATH || "/api/provider-nodes",
-  availabilityPath: process.env.ROUTER_AVAILABILITY_PATH || "/api/models/availability",
+  modelsPath: "/v1/models",
+  apiModelsPath: "/api/models",
+  providerNodesPath: "/api/provider-nodes",
+  availabilityPath: "/api/models/availability",
   dbPath: process.env.ROUTER_DB_PATH || path.join(HOME, ".9router", "db", "data.sqlite"),
-  dbKeyQuery:
-    process.env.ROUTER_DB_KEY_QUERY ||
-    "SELECT key FROM apiKeys WHERE isActive = 1 ORDER BY createdAt ASC LIMIT 1",
-  dbNodesQuery:
-    process.env.ROUTER_DB_NODES_QUERY ||
-    "SELECT provider, data FROM providerConnections WHERE isActive = 1",
-  upstreamTimeout: Number(process.env.ROUTER_UPSTREAM_TIMEOUT || 20),
-  probeTimeout: Number(process.env.ROUTER_PROBE_TIMEOUT || 20),
-  probeConcurrency: Number(process.env.ROUTER_PROBE_CONCURRENCY || 12),
-  probeMaxTokens: Number(process.env.ROUTER_PROBE_MAX_TOKENS || 256),
+  dbKeyQuery: "SELECT key FROM apiKeys WHERE isActive = 1 ORDER BY createdAt ASC LIMIT 1",
+  dbNodesQuery: "SELECT provider, data FROM providerConnections WHERE isActive = 1",
+  probeTimeout: envNum("ROUTER_PROBE_TIMEOUT", 10),
+  probeConcurrency: envNum("ROUTER_PROBE_CONCURRENCY", 16),
+  providerConcurrency: envNum("ROUTER_PROBE_PER_PROVIDER", 3),
+  probeMaxTokens: envNum("ROUTER_PROBE_MAX_TOKENS", 64),
+  probeTtlHours: envNum("ROUTER_PROBE_TTL", 12),
+  failTtlHours: envNum("ROUTER_FAIL_TTL", 1),
+  metadataTtlHours: envNum("ROUTER_METADATA_TTL", 12),
+  upstreamTimeout: envNum("ROUTER_UPSTREAM_TIMEOUT", 8),
 };
 
 const OPTION_SPEC = {
@@ -55,126 +71,82 @@ const OPTION_SPEC = {
   dryRun: { type: "bool", short: "n", long: "dry-run" },
   config: { type: "string" },
   router: { type: "string" },
-  apiBase: { type: "string", long: "api-base" },
-  apiKey: { type: "string", long: "api-key" },
-  db: { type: "string" },
-  dbKeyQuery: { type: "string", long: "db-key-query" },
-  dbNodesQuery: { type: "string", long: "db-nodes-query" },
-  package: { type: "string" },
-  schema: { type: "string" },
-  modelsPath: { type: "string", long: "models-path" },
-  apiModelsPath: { type: "string", long: "api-models-path" },
-  providerNodesPath: { type: "string", long: "provider-nodes-path" },
-  availabilityPath: { type: "string", long: "availability-path" },
   provider: { type: "list" },
-  exclude: { type: "list" },
   model: { type: "list" },
-  excludeModel: { type: "list", long: "exclude-model" },
-  limit: { type: "number" },
-  keepMissing: { type: "bool", long: "keep-missing" },
-  pruneMissing: { type: "bool", long: "prune-missing" },
-  replace: { type: "bool" },
-  backup: { type: "bool" },
-  noBackup: { type: "bool", long: "no-backup" },
-  reload: { type: "bool" },
-  noReload: { type: "bool", long: "no-reload" },
-  minModels: { type: "number", long: "min-models" },
-  allowEmpty: { type: "bool", long: "allow-empty" },
+  noProbe: { type: "bool", long: "no-probe" },
+  refresh: { type: "bool" },
   json: { type: "bool" },
   quiet: { type: "bool" },
   verbose: { type: "bool" },
-  showUnavailable: { type: "bool", long: "show-unavailable" },
-  showContext: { type: "bool", long: "show-context" },
-  noUpstreamMetadata: { type: "bool", long: "no-upstream-metadata" },
-  upstreamTimeout: { type: "number", long: "upstream-timeout" },
-  probe: { type: "bool" },
-  noProbe: { type: "bool", long: "no-probe" },
-  probeTimeout: { type: "number", long: "probe-timeout" },
-  probeConcurrency: { type: "number", long: "probe-concurrency" },
-  probeMaxTokens: { type: "number", long: "probe-max-tokens" },
-  showDropped: { type: "bool", long: "show-dropped" },
-  probeSkip: { type: "list", long: "probe-skip" },
 };
 
 let opts = {};
-let apiKey = "";
 let baseURL = "";
 let apiBase = "";
+let apiKey = "";
 let dbPath = DEFAULTS.dbPath;
 let configPath = "";
 let statePath = "";
+let cachePath = "";
 let limitOverrides = {};
+let nodeById = new Map();
+let nodeByPrefix = new Map();
 
+const t0 = Date.now();
 const clone = (value) => (value == null ? value : JSON.parse(JSON.stringify(value)));
+const nowIso = () => new Date().toISOString();
+const elapsed = (start = t0) => Date.now() - start;
+
+function info(msg = "") {
+  if (!opts.quiet && !opts.json) console.log(msg);
+}
+function verbose(msg = "") {
+  if ((opts.verbose || envBool("ROUTER_DEBUG")) && !opts.json) console.log(msg);
+}
+function warn(msg) {
+  if (!opts.json) console.error(msg);
+}
+function progress(msg) {
+  if (!opts.progress || opts.json || opts.quiet) return;
+  process.stderr.write(`\r${msg}\x1b[K`);
+}
+function progressDone() {
+  if (!opts.progress || opts.json || opts.quiet) return;
+  process.stderr.write("\r\x1b[K");
+}
 
 function printHelp() {
   console.log(
     [
       `sync-9router-opencode v${VERSION}`,
       "",
-      "Generic 9router -> OpenCode config sync. No hardcoded providers or models.",
-      "Only models that actually respond to a probe are written (use --no-probe to disable).",
+      "Sync the live 9router catalog into OpenCode, with cache-backed live probing.",
       "",
       "USAGE",
       "  sync-9router-opencode [options]",
       "",
       "OPTIONS",
-      "  -h, --help               Show this help",
-      "  -v, --version            Show version",
-      "  -n, --dry-run            Build but do not write",
-      "      --config <path>      OpenCode config path",
-      "      --router <url>       9router URL",
-      "      --api-base <url>     9router API base URL",
-      "      --api-key <key>      9router API key",
-      "      --db <path>          9router SQLite database",
-      "      --db-key-query <sql> SQL used to read the API key from the DB",
-      "      --db-nodes-query <sql>",
-      "                           SQL used to read provider connection keys",
-      "      --no-upstream-metadata",
-      "                           Do not read /models from upstream providers",
-      "      --upstream-timeout <s> Upstream metadata timeout (default 20)",
+      "  -h, --help              Show this help",
+      "  -v, --version           Show version",
+      "  -n, --dry-run           Probe and build, but write nothing",
+      "      --config <path>     OpenCode config path",
+      "      --router <url>      9router URL",
+      "      --provider <list>   Only touch matching providers",
+      "      --model <glob>      Only touch matching models",
+      "      --no-probe          Trust the catalog without live probing",
+      "      --refresh           Ignore caches and re-check everything",
+      "      --json              Machine-readable output (includes all details)",
+      "      --quiet             Only errors and warnings",
+      "      --verbose           Explain cache/metadata/probe decisions",
       "",
-      "PROBE",
-      "      --no-probe            Register every catalog model without testing",
-      "      --probe-timeout <s>   Per-request probe timeout (default 20)",
-      "      --probe-concurrency <n>",
-      "                           Parallel probe workers (default 12)",
-      "      --probe-max-tokens <n>",
-      "                           Output tokens for the probe (default 256)",
-      "      --show-dropped        List every model rejected by the probe",
-      "      --probe-skip <list>   Trust matching providers without probing",
-      "      --package <name>     OpenCode provider package",
-      "      --schema <url>       OpenCode config $schema",
-      "      --models-path <path> Override /v1/models path",
-      "      --api-models-path <path>",
-      "      --provider-nodes-path <path>",
-      "      --availability-path <path>",
+      "EXAMPLES",
+      "  sync-9router-opencode",
+      "  sync-9router-opencode --provider numes --refresh",
+      "  sync-9router-opencode --model '*deepseek*' --dry-run --json",
       "",
-      "FILTERS",
-      "      --provider <list>    Only matching providers (repeatable/comma list)",
-      "      --exclude <list>     Skip matching providers",
-      "      --model <glob>       Only matching model ids",
-      "      --exclude-model <glob>",
-      "      --limit <n>          Max models per provider (0 = unlimited)",
-      "",
-      "CONFIG SAFETY",
-      "      --keep-missing       Keep managed providers/models missing upstream",
-      "      --prune-missing      Drop them (default)",
-      "      --replace            Replace the whole provider map",
-      "      --no-backup          Do not write a backup",
-      "      --no-reload          Do not run 'opencode reload'",
-      "      --min-models <n>     Abort below this many managed models (default 1)",
-      "      --allow-empty        Allow an empty result",
-      "      --json               Machine-readable summary",
-      "      --show-unavailable   Show router-reported down connections",
-      "      --show-context       Print per-model context window + source",
-      "      --quiet, --verbose",
-      "",
-      "SOURCE OF TRUTH",
-      `  models:      ${DEFAULTS.modelsPath}`,
-      `  api models:  ${DEFAULTS.apiModelsPath}`,
-      `  nodes:       ${DEFAULTS.providerNodesPath}`,
-      `  health:      ${DEFAULTS.availabilityPath}`,
+      "CACHE",
+      `  ${CACHE_BASENAME} is written next to the config.`,
+      "  Delete it to force a cold probe; --refresh does the same for one run.",
     ].join("\n")
   );
 }
@@ -187,13 +159,11 @@ function parseArgs(argv) {
     longByKey[spec.long || key] = key;
     if (spec.short) shortByKey[spec.short] = key;
   }
-
   const fail = (msg) => {
     throw new Error(`${msg}\nRun with --help for usage.`);
   };
   const set = (key, value) => {
     const spec = OPTION_SPEC[key];
-    if (!spec) fail(`Unknown option: ${key}`);
     if (spec.type === "list") {
       const values = String(value)
         .split(",")
@@ -244,46 +214,36 @@ function parseArgs(argv) {
 
 function normalizeOptions(raw) {
   const o = { ...raw };
-  for (const key of ["provider", "exclude", "model", "excludeModel", "probeSkip"]) {
+  for (const key of ["provider", "model"]) {
     if (!Array.isArray(o[key])) o[key] = [];
   }
   o.dryRun = !!o.dryRun;
   o.json = !!o.json;
   o.quiet = !!o.quiet;
   o.verbose = !!o.verbose && !o.quiet && !o.json;
-  o.keepMissing = !!o.keepMissing;
-  if (o.keepMissing && o.pruneMissing) throw new Error("Use either --keep-missing or --prune-missing");
-  o.replace = !!o.replace;
-  o.backup = !o.noBackup && o.backup !== false;
-  o.reload = !o.noReload && o.reload !== false;
-  o.limit = o.limit != null ? Math.max(0, Math.floor(o.limit)) : 0;
-  o.minModels = o.minModels != null ? Math.max(0, Math.floor(o.minModels)) : 1;
-  o.allowEmpty = !!o.allowEmpty;
-  o.showUnavailable = !!o.showUnavailable;
-  o.showContext = !!o.showContext;
-  o.showDropped = !!o.showDropped;
-  o.probe = !o.noProbe && o.probe !== false;
-  const positive = (value, fallback) =>
-    value != null && Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : fallback;
-  o.probeTimeout = positive(o.probeTimeout, DEFAULTS.probeTimeout);
-  o.probeConcurrency = positive(o.probeConcurrency, DEFAULTS.probeConcurrency);
-  o.probeMaxTokens = positive(o.probeMaxTokens, DEFAULTS.probeMaxTokens);
-  o.noUpstreamMetadata = !!o.noUpstreamMetadata;
-  o.upstreamTimeout =
-    o.upstreamTimeout != null && Number.isFinite(o.upstreamTimeout)
-      ? Math.max(1, Math.floor(o.upstreamTimeout))
-      : DEFAULTS.upstreamTimeout;
+  o.progress =
+    !o.json &&
+    !o.quiet &&
+    process.stderr.isTTY &&
+    !envBool("ROUTER_NO_PROGRESS");
+  o.probe = !o.noProbe;
+  o.refresh = !!o.refresh;
+  o.backup = true;
+  o.reload = true;
+  // --refresh bypasses caches, it does not disable upstream metadata.
+  o.useUpstream = !envBool("ROUTER_NO_UPSTREAM");
+  o.useApiModels = envBool("ROUTER_API_MODELS");
+  o.useAvailability = envBool("ROUTER_AVAILABILITY");
+  o.useCache = !envBool("ROUTER_NO_CACHE");
+  o.probeTimeout = DEFAULTS.probeTimeout;
+  o.probeConcurrency = DEFAULTS.probeConcurrency;
+  o.providerConcurrency = DEFAULTS.providerConcurrency;
+  o.probeMaxTokens = DEFAULTS.probeMaxTokens;
+  o.probeTtlHours = DEFAULTS.probeTtlHours;
+  o.failTtlHours = DEFAULTS.failTtlHours;
+  o.metadataTtlHours = DEFAULTS.metadataTtlHours;
+  o.upstreamTimeout = DEFAULTS.upstreamTimeout;
   return o;
-}
-
-function info(msg = "") {
-  if (!opts.quiet && !opts.json) console.log(msg);
-}
-function verbose(msg = "") {
-  if (opts.verbose) console.log(msg);
-}
-function warn(msg) {
-  console.error(msg);
 }
 
 function expandHome(p) {
@@ -294,28 +254,17 @@ function expandHome(p) {
 }
 
 function normalizeRouter(value) {
-  let raw = String(value || "").trim() || `http://localhost:${DEFAULT_PORT}`;
+  let raw = String(value || "").trim() || "http://localhost:20128";
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = `http://${raw}`;
   raw = raw.replace(/\/+$/, "");
   if (/\/v1$/i.test(raw)) return { baseURL: raw, apiBase: raw.replace(/\/v1$/i, "") };
   return { baseURL: `${raw}/v1`, apiBase: raw };
 }
 
-function parseMaybeJson(value) {
-  if (!value) return {};
-  if (typeof value === "object") return value;
-  try { return JSON.parse(value); } catch (_) { return {}; }
-}
-
-function firstFinite(...values) {
-  for (const value of values) {
-    if (value != null && value !== "" && Number.isFinite(Number(value))) return Number(value);
-  }
-  return null;
-}
-
 function findConfigPath() {
-  const root = process.env.XDG_CONFIG_HOME ? path.resolve(process.env.XDG_CONFIG_HOME) : path.join(HOME, ".config");
+  const root = process.env.XDG_CONFIG_HOME
+    ? path.resolve(process.env.XDG_CONFIG_HOME)
+    : path.join(HOME, ".config");
   const dir = path.join(root, "opencode");
   const json = path.join(dir, "opencode.json");
   const jsonc = path.join(dir, "opencode.jsonc");
@@ -404,20 +353,29 @@ function parseJsonc(text) {
 
 function atomicWrite(file, content, mode = 0o600) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.tmp-${process.pid}-${Date.now()}`);
+  const tmp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.tmp-${process.pid}-${Date.now()}`
+  );
   try {
     fs.writeFileSync(tmp, content, { mode });
     fs.chmodSync(tmp, mode);
     fs.renameSync(tmp, file);
   } catch (err) {
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch (_) {}
     throw err;
   }
 }
 
 function backupFile(file) {
   if (!fs.existsSync(file)) return null;
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").replace(/\..+/, "");
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace("T", "-")
+    .replace(/\..+/, "");
   let backup = `${file}.bak-${stamp}`;
   if (fs.existsSync(backup)) backup += `-${process.pid}`;
   fs.copyFileSync(file, backup);
@@ -437,47 +395,132 @@ function loadConfig() {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new Error(`${configPath} must contain a JSON object`);
   }
-  if (config.providers != null && (typeof config.providers !== "object" || Array.isArray(config.providers))) {
+  if (
+    config.providers != null &&
+    (typeof config.providers !== "object" || Array.isArray(config.providers))
+  ) {
     throw new Error(`${configPath}: "providers" must be an object`);
   }
   return { config, raw };
 }
 
-function loadState() {
+function readJson(file, fallback = null) {
   try {
-    if (!fs.existsSync(statePath)) return {};
-    const value = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    return value && typeof value === "object" ? value : {};
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
-    warn(`Warning: ignoring unreadable state ${statePath}: ${err.message}`);
-    return {};
+    warn(`Warning: ignoring unreadable ${file}: ${err.message}`);
+    return fallback;
   }
 }
 
-function readLimitOverrides(file) {
-  try {
-    if (!fs.existsSync(file)) return {};
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (!parsed || typeof parsed !== "object") return {};
-    const out = {};
-    for (const [id, value] of Object.entries(parsed)) {
-      if (!value || typeof value !== "object") continue;
+function loadLimitOverrides(file) {
+  const parsed = readJson(file, {});
+  if (!parsed || typeof parsed !== "object") return {};
+  const out = {};
+  for (const [id, value] of Object.entries(parsed)) {
+    if (!value || typeof value !== "object") continue;
+    if (Number.isFinite(value.context) || Number.isFinite(value.output)) {
       const entry = {};
-      if (Number.isFinite(value.context)) entry.context = value.context;
-      if (Number.isFinite(value.output)) entry.output = value.output;
+      if (Number.isFinite(value.context) && value.context > 0) entry.context = value.context;
+      if (Number.isFinite(value.output) && value.output > 0) entry.output = value.output;
       if (Object.keys(entry).length) out[id] = entry;
+      continue;
     }
-    return out;
-  } catch (err) {
-    warn(`Warning: ignoring unreadable limits ${file}: ${err.message}`);
-    return {};
+    // Optional nested form: { "provider": { "model": { context, output } } }
+    const nested = {};
+    for (const [model, lim] of Object.entries(value)) {
+      if (!lim || typeof lim !== "object") continue;
+      const entry = {};
+      if (Number.isFinite(lim.context) && lim.context > 0) entry.context = lim.context;
+      if (Number.isFinite(lim.output) && lim.output > 0) entry.output = lim.output;
+      if (Object.keys(entry).length) nested[model] = entry;
+    }
+    if (Object.keys(nested).length) out[id] = nested;
   }
+  return out;
+}
+
+function sameEndpoint(a, b) {
+  const norm = (value) => {
+    try {
+      const u = new URL(String(value));
+      let host = u.hostname.toLowerCase();
+      if (host === "127.0.0.1" || host === "::1") host = "localhost";
+      return `${u.protocol}//${host}:${u.port || (u.protocol === "https:" ? 443 : 80)}${u.pathname.replace(/\/+$/, "")}`;
+    } catch (_) {
+      return String(value || "").toLowerCase().replace(/\/+$/, "");
+    }
+  };
+  return norm(a) === norm(b);
+}
+
+function loadState(config) {
+  const raw = readJson(statePath, {}) || {};
+  const managed = new Set();
+  if (Array.isArray(raw.providerIds)) raw.providerIds.forEach((id) => managed.add(String(id)));
+  if (raw.providers && typeof raw.providers === "object") {
+    Object.keys(raw.providers).forEach((id) => managed.add(String(id)));
+  }
+  // A provider pointed at this router is managed even if state was lost.
+  for (const [id, p] of Object.entries(config.providers || {})) {
+    const url = p && p.settings && p.settings.baseURL;
+    if (typeof url === "string" && sameEndpoint(url, baseURL)) managed.add(id);
+  }
+  for (const id of [...managed]) {
+    if (!config.providers || !config.providers[id]) managed.delete(id);
+  }
+  return { raw, managedIds: managed };
+}
+
+function loadCache() {
+  const raw = readJson(cachePath, null);
+  const empty = { version: 1, probes: {}, upstream: {}, catalog: null, updatedAt: null };
+  if (!raw || typeof raw !== "object") return empty;
+  return {
+    version: 1,
+    probes: raw.probes && typeof raw.probes === "object" ? raw.probes : {},
+    upstream: raw.upstream && typeof raw.upstream === "object" ? raw.upstream : {},
+    catalog: raw.catalog && Array.isArray(raw.catalog.data) ? raw.catalog : null,
+    updatedAt: raw.updatedAt || null,
+  };
+}
+
+function saveCache(cache, catalogIds = null) {
+  if (!opts.useCache) return false;
+  const probes = {};
+  const oldest = Date.now() - 30 * 24 * 3600 * 1000;
+  for (const [id, entry] of Object.entries(cache.probes || {})) {
+    if (!entry || typeof entry !== "object") continue;
+    if (catalogIds && !catalogIds.has(id)) continue;
+    if (entry.at && entry.at < oldest) continue;
+    probes[id] = entry;
+  }
+  const upstream = {};
+  for (const [prefix, entry] of Object.entries(cache.upstream || {})) {
+    if (!entry || typeof entry !== "object") continue;
+    if (nodeByPrefix.size && !nodeByPrefix.has(String(prefix).toLowerCase())) continue;
+    upstream[prefix] = entry;
+  }
+  atomicWrite(
+    cachePath,
+    `${JSON.stringify(
+      { version: 1, updatedAt: nowIso(), probes, upstream, catalog: cache.catalog || null },
+      null,
+      2
+    )}\n`
+  );
+  return true;
 }
 
 let nodeSqlite;
 function dbQuery(sql) {
   if (nodeSqlite === undefined) {
-    try { nodeSqlite = require("node:sqlite"); } catch (_) { nodeSqlite = null; }
+    try {
+      nodeSqlite = require("node:sqlite");
+    } catch (_) {
+      nodeSqlite = null;
+    }
   }
   if (nodeSqlite && nodeSqlite.DatabaseSync) {
     const db = new nodeSqlite.DatabaseSync(dbPath, { readOnly: true });
@@ -502,7 +545,7 @@ function dbQuery(sql) {
 }
 
 function getApiKeyFromDb() {
-  const rows = dbQuery(opts.dbKeyQuery || DEFAULTS.dbKeyQuery);
+  const rows = dbQuery(DEFAULTS.dbKeyQuery);
   const row = rows[0] || {};
   for (const key of ["key", "apiKey", "value", "token"]) {
     if (typeof row[key] === "string" && row[key].trim()) return row[key].trim();
@@ -510,86 +553,23 @@ function getApiKeyFromDb() {
   return null;
 }
 
-async function getUpstreamModelMeta(nodes) {
-  const out = new Map();
-  if (opts.noUpstreamMetadata || !nodes.length) return out;
-
-  let rows = [];
+function parseMaybeJson(value) {
+  if (!value) return {};
+  if (typeof value === "object") return value;
   try {
-    rows = dbQuery(opts.dbNodesQuery || DEFAULTS.dbNodesQuery);
-  } catch (err) {
-    warn(`Warning: could not read provider connections: ${err.message}`);
-    return out;
+    return JSON.parse(value);
+  } catch (_) {
+    return {};
   }
-
-  const keyByProvider = new Map();
-  for (const row of rows) {
-    if (!row || !row.provider) continue;
-    const data = parseMaybeJson(row.data);
-    const key = data.apiKey || data.key || data.token || data.accessToken;
-    if (typeof key === "string" && key.trim() && !keyByProvider.has(String(row.provider))) {
-      keyByProvider.set(String(row.provider), key.trim());
-    }
-  }
-
-  const jobs = [];
-  for (const node of nodes) {
-    if (!node || !node.id || !node.prefix) continue;
-    const key = keyByProvider.get(String(node.id));
-    if (!key) continue;
-    const nd = parseMaybeJson(node.data);
-    const base = String(nd.baseUrl || node.baseUrl || "").replace(/\/+$/, "");
-    if (!base) continue;
-    jobs.push((async () => {
-      const url = `${base}/models`;
-      try {
-        const raw = await fetchJson(url, opts.upstreamTimeout * 1000, false, key);
-        if (!raw) return;
-        const list = Array.isArray(raw) ? raw : Array.isArray(raw.data) ? raw.data : [];
-        for (const model of list) {
-          if (!model || !model.id) continue;
-          const context = firstFinite(
-            model.context_window,
-            model.contextWindow,
-            model.context_length,
-            model.context
-          );
-          const output = firstFinite(
-            model.max_output_tokens,
-            model.maxOutputTokens,
-            model.max_output,
-            model.max_completion_tokens
-          );
-          if (context == null && output == null) continue;
-          out.set(`${node.prefix}/${model.id}`, { context, output, source: "upstream" });
-        }
-      } catch (err) {
-        verbose(`(upstream) ${node.prefix}: ${err.message}`);
-      }
-    })());
-  }
-
-  await Promise.all(jobs);
-  return out;
 }
 
-async function fetchJson(url, timeoutMs = 30000, required = true, authOverride) {
-  try {
-    const token = authOverride !== undefined ? authOverride : apiKey;
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    const text = await res.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch (_) {}
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${String(text).slice(0, 200)}`);
-    return json;
-  } catch (err) {
-    if (!required) {
-      verbose(`(optional) ${url}: ${err.message}`);
-      return null;
-    }
-    throw err;
+function firstPositive(...values) {
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
   }
+  return null;
 }
 
 function sanitizeProviderId(value) {
@@ -628,23 +608,6 @@ function humanize(value) {
   return s.replace(/\b(\d+)\s*\.\s*(\d+)\b/g, "$1.$2");
 }
 
-function normalizeCompare(value) {
-  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-}
-
-function leafOf(modelPart) {
-  return String(modelPart).includes("/") ? String(modelPart).slice(String(modelPart).lastIndexOf("/") + 1) : String(modelPart);
-}
-
-function chooseModelName(entry, modelPart) {
-  const leaf = leafOf(modelPart);
-  const name = entry && typeof entry.name === "string" ? entry.name.trim() : "";
-  if (name && /\s/.test(name) && (normalizeCompare(name) === normalizeCompare(leaf) || normalizeCompare(name) === normalizeCompare(modelPart))) {
-    return name;
-  }
-  return humanize(leaf);
-}
-
 function globToRegex(glob) {
   let out = "";
   for (const ch of String(glob)) {
@@ -664,52 +627,558 @@ function providerMatches(meta, filters) {
   const haystack = [meta.id, meta.prefix, meta.name].map((v) => String(v).toLowerCase());
   return filters.some((filter) => {
     const f = String(filter).toLowerCase();
+    if (/[*?]/.test(f)) return haystack.some((v) => globToRegex(f).test(v));
     return haystack.some((v) => v === f || v.includes(f));
   });
 }
 
-const PERMANENT_ERROR_RE =
-  /(^|[^0-9])(400|401|403|404|410|422)([^0-9]|$)|not found|does not exist|no such model|unknown model|invalid model|model_not_supported|no active credentials|api key required/i;
-
-function isPermanentError(detail) {
-  return PERMANENT_ERROR_RE.test(String(detail || ""));
+function modelPartOf(modelId) {
+  const s = String(modelId || "");
+  return s.includes("/") ? s.slice(s.indexOf("/") + 1) : s;
 }
 
-function capabilitiesFrom(caps) {
-  const c = caps || {};
+function leafOf(modelPart) {
+  const s = String(modelPart || "");
+  return s.includes("/") ? s.slice(s.lastIndexOf("/") + 1) : s;
+}
+
+function chooseModelName(apiInfo, modelPart) {
+  const leaf = leafOf(modelPart);
+  const name = apiInfo && typeof apiInfo.name === "string" ? apiInfo.name.trim() : "";
+  if (name && name.toLowerCase() !== modelPart.toLowerCase() && name.toLowerCase() !== leaf.toLowerCase()) {
+    return /\s/.test(name) || /[A-Z]/.test(name) ? name : humanize(name);
+  }
+  return humanize(leaf);
+}
+
+function capabilitiesFrom(rawCaps, apiCaps) {
+  const c = { ...(apiCaps || {}), ...(rawCaps || {}) };
   const input = ["text"];
-  if (c.vision === true || c.imageInput === true) input.push("image");
-  if (c.pdf === true) input.push("pdf");
-  if (c.audioInput === true) input.push("audio");
-  if (c.videoInput === true) input.push("video");
+  const inputModalities =
+    (Array.isArray(c.input_modalities) && c.input_modalities) ||
+    (Array.isArray(c.architecture && c.architecture.input_modalities) &&
+      c.architecture.input_modalities) ||
+    [];
+  if (c.vision === true || c.imageInput === true || inputModalities.includes("image")) input.push("image");
+  if (c.pdf === true || inputModalities.includes("pdf")) input.push("pdf");
+  if (c.audioInput === true || inputModalities.includes("audio")) input.push("audio");
+  if (c.videoInput === true || inputModalities.includes("video")) input.push("video");
   const output = ["text"];
-  if (c.imageOutput === true) output.push("image");
-  if (c.audioOutput === true) output.push("audio");
+  const outputModalities =
+    (Array.isArray(c.output_modalities) && c.output_modalities) ||
+    (Array.isArray(c.architecture && c.architecture.output_modalities) &&
+      c.architecture.output_modalities) ||
+    [];
+  if (c.imageOutput === true || outputModalities.includes("image")) output.push("image");
+  if (c.audioOutput === true || outputModalities.includes("audio")) output.push("audio");
   const result = {
     tools: c.tools !== false,
     input: [...new Set(input)],
     output: [...new Set(output)],
   };
-  if (c.reasoning === true) result.reasoning = { supported: true };
+  if (c.reasoning === true || c.thinking === true || (c.reasoning && c.reasoning.supported === true)) {
+    result.reasoning = { supported: true };
+  }
   return result;
 }
 
-function limitFor(model) {
-  const override = limitOverrides[model.id];
-  if (override && (override.context > 0 || override.output > 0)) {
-    const out = {};
-    if (override.context > 0) out.context = override.context;
-    if (override.output > 0) out.output = override.output;
-    return out;
+function extractContextOutput(entry) {
+  const context = firstPositive(
+    entry.context_window,
+    entry.contextWindow,
+    entry.context_length,
+    entry.max_context_length,
+    entry.max_model_len,
+    entry.max_input_tokens,
+    entry.input_token_limit
+  );
+  const output = firstPositive(
+    entry.max_output_tokens,
+    entry.max_completion_tokens,
+    entry.max_output,
+    entry.output_token_limit,
+    entry.top_provider && entry.top_provider.max_completion_tokens,
+    entry.top_provider && entry.top_provider.max_output_tokens
+  );
+  return { context, output };
+}
+
+async function fetchJson(url, { timeout = 20000, auth = true, headers = {}, required = false } = {}) {
+  try {
+    const h = { ...headers };
+    if (auth && apiKey && !h.Authorization) h.Authorization = `Bearer ${apiKey}`;
+    if (!h["User-Agent"]) h["User-Agent"] = `sync-9router-opencode/${VERSION}`;
+    const res = await fetch(url, { headers: h, signal: AbortSignal.timeout(timeout) });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${String(text).slice(0, 200)}`);
+    try {
+      return text ? JSON.parse(text) : null;
+    } catch (_) {
+      throw new Error(`Invalid JSON from ${url}`);
+    }
+  } catch (err) {
+    const reason = err && err.cause && err.cause.message
+      ? `${err.message}: ${err.cause.message}`
+      : err.message;
+    if (!required) {
+      verbose(`(optional) ${url}: ${reason}`);
+      return null;
+    }
+    throw new Error(reason);
+  }
+}
+
+async function loadNodes() {
+  const nodesRaw = await fetchJson(`${apiBase}${DEFAULTS.providerNodesPath}`, {
+    timeout: 15000,
+    required: false,
+  });
+  const nodes = nodesRaw && Array.isArray(nodesRaw.nodes) ? nodesRaw.nodes : [];
+  let rows = [];
+  try {
+    rows = dbQuery(DEFAULTS.dbNodesQuery);
+  } catch (err) {
+    verbose(`(db) provider connections unavailable: ${err.message}`);
+  }
+
+  const keyByProvider = new Map();
+  for (const row of rows) {
+    if (!row || !row.provider) continue;
+    const data = parseMaybeJson(row.data);
+    const key = data.apiKey || data.key || data.token || data.accessToken;
+    if (typeof key === "string" && key.trim() && !keyByProvider.has(String(row.provider))) {
+      keyByProvider.set(String(row.provider), key.trim());
+    }
+  }
+
+  nodeById = new Map();
+  nodeByPrefix = new Map();
+  for (const node of nodes) {
+    if (!node || !node.id) continue;
+    const data = parseMaybeJson(node.data);
+    const base = String(node.baseUrl || data.baseUrl || "").replace(/\/+$/, "");
+    const key = keyByProvider.get(String(node.id)) || "";
+    const info = {
+      id: String(node.id),
+      prefix: node.prefix ? String(node.prefix) : "",
+      name: node.name ? String(node.name) : "",
+      baseUrl: base,
+      key,
+      keyHash: crypto.createHash("sha256").update(key || "none").digest("hex").slice(0, 16),
+      headers: data.headers && typeof data.headers === "object" ? data.headers : {},
+    };
+    nodeById.set(info.id, info);
+    if (info.prefix) {
+      const p = info.prefix.toLowerCase();
+      if (!nodeByPrefix.has(p)) nodeByPrefix.set(p, info);
+      else verbose(`(nodes) duplicate prefix "${info.prefix}" ignored for ${info.id}`);
+    }
+  }
+  return { nodes, keyByProvider };
+}
+
+function buildApiModelIndex(apiModels) {
+  const out = new Map();
+  for (const entry of apiModels || []) {
+    if (!entry || !entry.provider) continue;
+    const node = nodeById.get(String(entry.provider));
+    const prefix = node && node.prefix ? node.prefix : String(entry.provider);
+    const keys = new Set();
+    if (typeof entry.fullModel === "string" && entry.fullModel) keys.add(entry.fullModel);
+    if (typeof entry.routedModel === "string" && entry.routedModel) keys.add(entry.routedModel);
+    if (entry.model) keys.add(`${prefix}/${entry.model}`);
+    if (entry.alias) keys.add(`${prefix}/${entry.alias}`);
+    const info = { name: entry.name || "", caps: entry.caps || {} };
+    for (const key of keys) {
+      if (!out.has(key)) out.set(key, info);
+    }
+  }
+  return out;
+}
+
+function buildAvailability() {
+  const byModel = new Map();
+  const byPrefix = new Map();
+  if (!opts.useAvailability) return { byModel, byPrefix };
+  return { byModel, byPrefix, pending: true };
+}
+
+async function loadAvailability(byModel, byPrefix) {
+  if (!opts.useAvailability) return;
+  const raw = await fetchJson(`${apiBase}${DEFAULTS.availabilityPath}`, {
+    timeout: 15000,
+    required: false,
+  });
+  const rows = raw && Array.isArray(raw.models) ? raw.models : [];
+  for (const row of rows) {
+    if (!row || !row.provider) continue;
+    const node = nodeById.get(String(row.provider));
+    const prefix = node && node.prefix ? node.prefix : String(row.provider);
+    const entry = { status: row.status || "unavailable", lastError: row.lastError || "" };
+    if (row.model && row.model !== "__all") {
+      byModel.set(`${prefix}/${row.model}`, entry);
+    } else {
+      if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
+      byPrefix.get(prefix).push(entry);
+    }
+  }
+}
+
+const PERMANENT_ERROR_RE =
+  /(^|[^0-9])(400|401|402|403|404|410|413|422)([^0-9]|$)|not found|does not exist|no such model|unknown model|invalid model|model_not_supported|no active credentials|api key required|unauthorized|forbidden|insufficient credits|model is unavailable/i;
+
+function isPermanentError(detail) {
+  return PERMANENT_ERROR_RE.test(String(detail || ""));
+}
+
+function isTransientReason(detail) {
+  return /429|timeout|timed out|fetch failed|network|socket|ECONN|ENOTFOUND|EAI_AGAIN|50[0-9]|empty response|no result/i.test(
+    String(detail || "")
+  );
+}
+
+function createProviderResolver(existingProviders, managedIds) {
+  const managed = new Set(managedIds);
+  const unmanaged = new Set(
+    Object.keys(existingProviders || {}).filter((id) => !managed.has(id))
+  );
+  const prefixToManaged = new Map();
+  for (const id of managed) {
+    const p = existingProviders[id];
+    if (!p) continue;
+    let prefix = "";
+    for (const entry of Object.values(p.models || {})) {
+      const mid = entry && entry.modelID;
+      if (typeof mid === "string" && mid.includes("/")) {
+        prefix = mid.slice(0, mid.indexOf("/"));
+        break;
+      }
+    }
+    if (!prefix && nodeById.has(id) && nodeById.get(id).prefix) prefix = nodeById.get(id).prefix;
+    if (!prefix) prefix = id;
+    if (!prefixToManaged.has(prefix.toLowerCase())) {
+      prefixToManaged.set(prefix.toLowerCase(), id);
+    }
+  }
+
+  const maps = new Map();
+  const mapText = process.env.ROUTER_PROVIDER_MAP || "";
+  for (const item of mapText.split(",")) {
+    const [from, to] = item.split("=").map((v) => (v || "").trim());
+    if (from && to) maps.set(from.toLowerCase(), to);
+  }
+
+  const claimed = new Map();
+  for (const [prefix, id] of prefixToManaged) claimed.set(id, prefix);
+  const cache = new Map();
+
+  const alternate = (candidate, prefix) => {
+    const base = sanitizeProviderId(candidate);
+    const options = [base, `${base}-router`, `${base}-2`, `${base}-3`];
+    for (const id of options) {
+      if (unmanaged.has(id)) continue;
+      if (claimed.has(id) && claimed.get(id) !== prefix) continue;
+      return id;
+    }
+    let n = 4;
+    while (unmanaged.has(`${base}-${n}`) || (claimed.has(`${base}-${n}`) && claimed.get(`${base}-${n}`) !== prefix)) n++;
+    return `${base}-${n}`;
+  };
+
+  return (prefix) => {
+    const key = String(prefix).toLowerCase();
+    if (cache.has(key)) return cache.get(key);
+    const mapped = maps.get(key);
+    const existing = prefixToManaged.get(key);
+    let candidate = mapped || existing || sanitizeProviderId(prefix);
+    if (mapped && unmanaged.has(mapped)) {
+      throw new Error(
+        `Provider map "${prefix}=${mapped}" would overwrite unmanaged provider "${mapped}". Refusing.`
+      );
+    }
+    if (unmanaged.has(candidate) || (claimed.has(candidate) && claimed.get(candidate) !== key)) {
+      candidate = alternate(candidate, key);
+    }
+    const node = nodeByPrefix.get(key);
+    const existingProvider = existing ? existingProviders[existing] : null;
+    const name =
+      (existingProvider && existingProvider.name) ||
+      (node && node.name) ||
+      humanize(prefix);
+    const meta = { id: candidate, prefix: String(prefix), name };
+    claimed.set(candidate, key);
+    cache.set(key, meta);
+    return meta;
+  };
+}
+
+function providerMetaForExisting(id, provider) {
+  let prefix = "";
+  for (const entry of Object.values((provider && provider.models) || {})) {
+    const mid = entry && entry.modelID;
+    if (typeof mid === "string" && mid.includes("/")) {
+      prefix = mid.slice(0, mid.indexOf("/"));
+      break;
+    }
+  }
+  if (!prefix && nodeById.has(id) && nodeById.get(id).prefix) prefix = nodeById.get(id).prefix;
+  if (!prefix) prefix = id;
+  const node = nodeByPrefix.get(String(prefix).toLowerCase());
+  return {
+    id,
+    prefix,
+    name: (provider && provider.name) || (node && node.name) || humanize(prefix),
+  };
+}
+
+function lookupOverride(model) {
+  const candidates = [
+    limitOverrides[model.id],
+    limitOverrides[`${model.providerId}/${model.modelPart}`],
+    limitOverrides[model.modelPart],
+  ];
+  if (limitOverrides[model.providerId] && typeof limitOverrides[model.providerId] === "object") {
+    candidates.push(limitOverrides[model.providerId][model.modelPart]);
   }
   const out = {};
-  if (Number.isFinite(model.context) && model.context > 0) out.context = model.context;
-  if (Number.isFinite(model.output) && model.output > 0) out.output = model.output;
-  return Object.keys(out).length ? out : undefined;
+  for (const value of candidates) {
+    if (!value || typeof value !== "object") continue;
+    if (Number.isFinite(value.context) && value.context > 0) out.context = value.context;
+    if (Number.isFinite(value.output) && value.output > 0) out.output = value.output;
+  }
+  return out;
+}
+
+function buildModelList(catalog, apiIndex, availability) {
+  const models = [];
+  const dropped = [];
+  const resolve = createProviderResolver(
+    (global.__existingConfig && global.__existingConfig.providers) || {},
+    global.__managedIds || new Set()
+  );
+  const counts = new Map();
+  for (const raw of catalog) {
+    const id = raw && typeof raw.id === "string" ? raw.id : null;
+    if (!id || !id.includes("/")) continue;
+    const prefix = id.slice(0, id.indexOf("/"));
+    const modelPart = id.slice(prefix.length + 1);
+    const meta = resolve(prefix);
+    if (!providerMatches(meta, opts.provider)) continue;
+    if (opts.model.length && !matchesAny(id, opts.model) && !matchesAny(modelPart, opts.model)) continue;
+
+    if (opts.useAvailability) {
+      const mh = availability.byModel.get(id);
+      if (mh && isPermanentError(mh.lastError)) {
+        dropped.push({ id, reason: `availability: ${mh.lastError}`, source: "availability" });
+        continue;
+      }
+      const ph = availability.byPrefix.get(prefix) || [];
+    const bad = ph.find((r) => isPermanentError(r.lastError));
+      if (bad) {
+        dropped.push({ id, reason: `availability: ${bad.lastError}`, source: "availability" });
+        continue;
+      }
+    }
+
+    const apiInfo = apiIndex.get(id);
+    const caps = capabilitiesFrom(raw.capabilities || {}, apiInfo ? apiInfo.caps : {});
+    const node = nodeByPrefix.get(prefix.toLowerCase());
+    const model = {
+      id,
+      prefix,
+      modelPart,
+      providerId: meta.id,
+      providerName: meta.name,
+      providerPrefix: meta.prefix,
+      providerKeyHash: node ? node.keyHash : "none",
+      name: chooseModelName(apiInfo, modelPart),
+      caps,
+      routerContext: firstPositive(
+        raw.capabilities && raw.capabilities.contextWindow,
+        raw.context_length,
+        raw.context_window
+      ),
+      routerOutput: firstPositive(
+        raw.capabilities && raw.capabilities.maxOutput,
+        raw.max_completion_tokens,
+        raw.max_output_tokens
+      ),
+      context: null,
+      output: null,
+      contextSource: "none",
+      outputSource: "none",
+      limit: null,
+    };
+    const n = counts.get(model.providerId) || 0;
+    counts.set(model.providerId, n + 1);
+    models.push(model);
+  }
+  return { models, dropped };
+}
+
+function providerFingerprint(node) {
+  return crypto
+    .createHash("sha256")
+    .update(`${node.baseUrl}|${node.keyHash}`)
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function probeFingerprint(model) {
+  return crypto
+    .createHash("sha256")
+    .update(
+      [
+        baseURL,
+        model.providerId,
+        model.providerKeyHash,
+        model.id,
+        JSON.stringify(model.caps || {}),
+      ].join("|")
+    )
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function upstreamModelsUrl(base) {
+  let u = String(base || "").replace(/\/+$/, "");
+  if (/\/models$/i.test(u)) return u;
+  return `${u}/models`;
+}
+
+function isLocalUrl(value) {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch (_) {
+    return false;
+  }
+}
+
+async function loadUpstreamMetadata(models, cache) {
+  const result = new Map();
+  const stats = { fetched: 0, cached: 0, stale: 0, failed: 0, models: 0 };
+  if (!opts.useUpstream || !models.length) return { map: result, stats };
+
+  const groups = new Map();
+  for (const model of models) {
+    const node = nodeByPrefix.get(model.prefix.toLowerCase());
+    if (!node || !node.baseUrl || !node.key) continue;
+    if (!groups.has(model.prefix)) groups.set(model.prefix, { node, models: [] });
+    groups.get(model.prefix).models.push(model);
+  }
+
+  const fetchGroup = async ({ node, models: groupModels }) => {
+    const prefix = node.prefix;
+    const fullOverride = groupModels.every((m) => {
+      const o = lookupOverride(m);
+      return o.context && o.output;
+    });
+    if (fullOverride) return;
+
+    const fp = providerFingerprint(node);
+    const cached = cache.upstream[prefix];
+    const cachedValid =
+      cached &&
+      cached.fingerprint === fp &&
+      cached.at &&
+      Date.now() - cached.at < opts.metadataTtlHours * 3600 * 1000;
+    if (!opts.refresh && cachedValid) {
+      stats.cached++;
+      for (const [id, value] of Object.entries(cached.models || {})) {
+        if (value && (value.context || value.output)) result.set(id, { ...value, source: "upstream-cache" });
+      }
+      return;
+    }
+
+    try {
+      const timeout = isLocalUrl(node.baseUrl)
+        ? Math.min(opts.upstreamTimeout, 3)
+        : opts.upstreamTimeout;
+      const headers = { ...(node.headers || {}) };
+      if (node.key && !headers.Authorization) headers.Authorization = `Bearer ${node.key}`;
+      const url = upstreamModelsUrl(node.baseUrl);
+      verbose(`(upstream) ${prefix}: ${url} timeout=${timeout}s key=${node.key ? `${node.key.slice(0, 10)}…` : "none"}`);
+      const raw = await fetchJson(url, { timeout: timeout * 1000, auth: false, headers, required: true });
+      const list = Array.isArray(raw) ? raw : raw && Array.isArray(raw.data) ? raw.data : [];
+      const map = {};
+      for (const entry of list) {
+        if (!entry || !entry.id) continue;
+        const { context, output } = extractContextOutput(entry);
+        if (!context && !output) continue;
+        const value = { context, output };
+        const id = String(entry.id);
+        map[id] = value;
+        // Router catalog ids always carry the node prefix. Upstream ids may not.
+        map[`${prefix}/${id}`] = value;
+        if (id.startsWith(`${prefix}/`)) map[id.slice(prefix.length + 1)] = value;
+      }
+      cache.upstream[prefix] = { at: Date.now(), fingerprint: fp, models: map };
+      stats.fetched++;
+      for (const [id, value] of Object.entries(map)) {
+        result.set(id, { ...value, source: "upstream" });
+      }
+    } catch (err) {
+      if (cached && cached.fingerprint === fp) {
+        stats.stale++;
+        for (const [id, value] of Object.entries(cached.models || {})) {
+          if (value && (value.context || value.output)) result.set(id, { ...value, source: "upstream-stale" });
+        }
+      } else {
+        stats.failed++;
+        verbose(`(upstream) ${prefix}: ${err.message}`);
+      }
+    }
+  };
+
+  const groupsList = [...groups.values()];
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(6, groupsList.length));
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (cursor < groupsList.length) {
+        const idx = cursor++;
+        await fetchGroup(groupsList[idx]);
+      }
+    })
+  );
+  stats.models = result.size;
+  return { map: result, stats };
+}
+
+function applyLimits(models, upstream) {
+  for (const model of models) {
+    const override = lookupOverride(model);
+    const up = upstream.get(model.id);
+    const context = override.context || (up && up.context) || model.routerContext || null;
+    const output = override.output || (up && up.output) || model.routerOutput || null;
+    model.context = context;
+    model.output = output;
+    model.contextSource = override.context
+      ? "override"
+      : up && up.context
+        ? up.source || "upstream"
+        : model.routerContext
+          ? "router"
+          : "none";
+    model.outputSource = override.output
+      ? "override"
+      : up && up.output
+        ? up.source || "upstream"
+        : model.routerOutput
+          ? "router"
+          : "none";
+    if (context || output) {
+      model.limit = {};
+      if (context) model.limit.context = context;
+      if (output) model.limit.output = output;
+    } else {
+      model.limit = null;
+    }
+  }
 }
 
 function pickPackage(providerId, existingProviders) {
-  if (opts.package) return opts.package;
   const own = existingProviders[providerId];
   if (own && typeof own.package === "string" && own.package) return own.package;
   for (const provider of Object.values(existingProviders)) {
@@ -718,13 +1187,7 @@ function pickPackage(providerId, existingProviders) {
   return DEFAULTS.package;
 }
 
-function contextSourceFor(model) {
-  const override = limitOverrides[model.id];
-  if (override && (override.context > 0 || override.output > 0)) return "override";
-  return model.contextSource || "router";
-}
-
-function buildProviders(models, existingProviders) {
+function buildProviders(models, existingProviders, keptIds = new Set()) {
   const groups = new Map();
   for (const model of models) {
     if (!groups.has(model.providerId)) {
@@ -734,405 +1197,899 @@ function buildProviders(models, existingProviders) {
   }
 
   const providers = {};
-  for (const [id, group] of [...groups.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name))) {
+  for (const [id, group] of [...groups.entries()].sort((a, b) =>
+    a[1].name.localeCompare(b[1].name)
+  )) {
+    const existing = existingProviders[id] || {};
+    const existingByModelId = new Map();
+    for (const [key, entry] of Object.entries(existing.models || {})) {
+      if (entry && typeof entry.modelID === "string") existingByModelId.set(entry.modelID, { key, entry });
+    }
     const used = new Set();
     const entries = {};
     for (const model of group.models) {
-      let key = sanitizeModelKey(model.modelPart);
-      if (used.has(key)) {
+      const previous = existingByModelId.get(model.id);
+      let key = previous && previous.key;
+      if (!key || used.has(key)) {
+        const base = sanitizeModelKey(leafOf(model.modelPart));
+        const full = sanitizeModelKey(model.modelPart);
+        key = !used.has(base) ? base : !used.has(full) ? full : base;
         let n = 2;
-        while (used.has(`${key}-${n}`)) n++;
-        key = `${key}-${n}`;
+        while (used.has(key)) key = `${base}-${n++}`;
       }
       used.add(key);
+      if (keptIds.has(model.id) && previous && previous.entry) {
+        entries[key] = { ...previous.entry, modelID: model.id };
+        continue;
+      }
       const entry = {
+        ...(previous ? previous.entry : {}),
         modelID: model.id,
-        name: model.name,
-        capabilities: capabilitiesFrom(model.caps),
+        name:
+          previous && previous.entry && previous.entry.name
+            ? previous.entry.name
+            : model.name,
+        capabilities: model.caps,
       };
-      const limit = limitFor(model);
-      if (limit) entry.limit = limit;
+      if (model.limit) entry.limit = model.limit;
+      else delete entry.limit;
       entries[key] = entry;
     }
     providers[id] = {
-      name: group.name,
+      name: existing.name || group.name,
       package: pickPackage(id, existingProviders),
       settings: { baseURL, apiKey },
-      models: entries,
+      models: Object.fromEntries(Object.entries(entries).sort((a, b) => a[0].localeCompare(b[0]))),
     };
   }
   return providers;
 }
 
-function mergeConfig(existing, generated, state) {
-  const result = clone(existing || {});
-  const generatedIds = new Set(Object.keys(generated));
-  const previousIds = Array.isArray(state.providerIds) ? state.providerIds.map(String) : [];
-  const managedIds = new Set([...previousIds, ...generatedIds]);
-
-  if (opts.replace) {
-    result.providers = generated;
-    return { config: result, managedIds: generatedIds };
-  }
-
-  const providers = result.providers && typeof result.providers === "object" ? { ...result.providers } : {};
+function collectManaged(providers, managedIds) {
+  const out = new Map();
   for (const id of managedIds) {
-    if (!generated[id] && !opts.keepMissing) delete providers[id];
+    const provider = providers[id];
+    if (!provider) continue;
+    for (const entry of Object.values(provider.models || {})) {
+      if (entry && typeof entry.modelID === "string") {
+        out.set(entry.modelID, JSON.stringify(entry));
+      }
+    }
   }
-  for (const [id, incoming] of Object.entries(generated)) {
-    const previous = providers[id] || {};
-    const next = { ...previous, ...clone(incoming) };
-    if (previous.settings && incoming.settings) next.settings = { ...previous.settings, ...incoming.settings };
-    if (opts.keepMissing && previous.models) next.models = { ...previous.models, ...incoming.models };
-    providers[id] = next;
+  return out;
+}
+
+function mergeProvider(existing, incoming) {
+  const next = { ...(existing || {}), ...(incoming || {}) };
+  if (existing && existing.settings && incoming && incoming.settings) {
+    next.settings = { ...existing.settings, ...incoming.settings };
   }
-  result.providers = providers;
+  return next;
+}
+
+function mergeConfig(existing, generated, state) {
+  const probeStats = global.__probeStats || new Map();
+  const permanentIds = global.__permanentIds || new Set();
+  const result = clone(existing || {});
+  const providers = { ...(result.providers || {}) };
+  const managed = new Set(state.managedIds);
+  const generatedIds = new Set(Object.keys(generated));
+  const hasModelFilter = opts.model.length > 0;
+  const before = collectManaged(providers, managed);
+  const providersBefore = new Set([...managed].filter((id) => providers[id]));
+  const keptProviders = [];
+
+  const providerSelected = (meta) => {
+    if (!opts.provider.length) return true;
+    return providerMatches(meta, opts.provider);
+  };
+  const modelInScope = (modelId) => {
+    if (!hasModelFilter) return true;
+    const part = modelPartOf(modelId);
+    return matchesAny(modelId, opts.model) || matchesAny(part, opts.model);
+  };
+
+  for (const id of [...managed]) {
+    const provider = providers[id];
+    if (!provider) {
+      managed.delete(id);
+      continue;
+    }
+    const meta = providerMetaForExisting(id, provider);
+    if (!generatedIds.has(id) && !providerSelected(meta)) continue;
+    const gen = generated[id];
+
+    if (!gen) {
+      if (!hasModelFilter) {
+        const existingModelIds = Object.values(provider.models || {})
+          .map((entry) => entry && entry.modelID)
+          .filter(Boolean);
+        const allPermanent =
+          existingModelIds.length > 0 && existingModelIds.every((mid) => permanentIds.has(mid));
+        const nodeExists =
+          nodeById.has(id) || nodeByPrefix.has(String(meta.prefix).toLowerCase());
+        if (nodeExists && !allPermanent) {
+          keptProviders.push(id);
+          continue;
+        }
+        delete providers[id];
+        managed.delete(id);
+        continue;
+      }
+      const models = { ...(provider.models || {}) };
+      let removed = false;
+      for (const [key, entry] of Object.entries(models)) {
+        if (entry && entry.modelID && modelInScope(entry.modelID)) {
+          delete models[key];
+          removed = true;
+        }
+      }
+      if (!Object.keys(models).length) {
+        delete providers[id];
+        managed.delete(id);
+      } else if (removed) {
+        providers[id] = { ...provider, models };
+      }
+      continue;
+    }
+
+    if (!hasModelFilter) {
+      const next = mergeProvider(provider, gen);
+      next.models = gen.models;
+      if (!Object.keys(next.models).length) {
+        delete providers[id];
+        managed.delete(id);
+      } else {
+        providers[id] = next;
+      }
+      continue;
+    }
+
+    const models = { ...(provider.models || {}) };
+    const genIds = new Set(Object.values(gen.models).map((entry) => entry.modelID));
+    for (const [key, entry] of Object.entries(models)) {
+      if (entry && entry.modelID && modelInScope(entry.modelID) && !genIds.has(entry.modelID)) {
+        delete models[key];
+      }
+    }
+    for (const [desiredKey, entry] of Object.entries(gen.models)) {
+      let key = desiredKey;
+      let n = 2;
+      while (models[key] && models[key].modelID !== entry.modelID) key = `${desiredKey}-${n++}`;
+      models[key] = entry;
+    }
+    if (!Object.keys(models).length) {
+      delete providers[id];
+      managed.delete(id);
+    } else {
+      providers[id] = { ...mergeProvider(provider, gen), models };
+    }
+  }
+
+  for (const [id, gen] of Object.entries(generated)) {
+    if (providers[id]) {
+      if (managed.has(id)) continue;
+      throw new Error(`Provider id "${id}" exists but is not managed. Refusing to overwrite it.`);
+    }
+    providers[id] = gen;
+    managed.add(id);
+  }
+
+  result.providers = Object.fromEntries(
+    Object.entries(providers).sort((a, b) => a[0].localeCompare(b[0]))
+  );
   if (result.provider) delete result.provider;
-  const finalIds = new Set([...managedIds].filter((id) => providers[id]));
-  return { config: result, managedIds: finalIds };
+  const after = collectManaged(result.providers, managed);
+  return {
+    config: result,
+    managedIds: managed,
+    before,
+    after,
+    providersBefore,
+    providersAfter: new Set([...managed].filter((id) => result.providers[id])),
+    keptProviders,
+  };
 }
 
-function countManagedModels(config, ids) {
-  let count = 0;
-  for (const id of ids) {
-    const provider = (config.providers || {})[id];
-    if (provider && provider.models) count += Object.keys(provider.models).length;
+function buildState(managedIds, config) {
+  const providerIds = [...managedIds].filter((id) => config.providers && config.providers[id]).sort();
+  const providers = {};
+  for (const id of providerIds) {
+    const provider = config.providers[id];
+    if (!provider) continue;
+    const meta = providerMetaForExisting(id, provider);
+    const models = Object.values(provider.models || {})
+      .map((entry) => entry && entry.modelID)
+      .filter((v) => typeof v === "string")
+      .sort();
+    providers[id] = { prefix: meta.prefix, name: provider.name || meta.name, models };
   }
-  return count;
+  return {
+    version: 5,
+    format: "opencode-sync/v5",
+    router: baseURL,
+    updatedAt: nowIso(),
+    providerIds,
+    providers,
+  };
 }
 
-
-function extractContent(json) {
+function extractProbeContent(json) {
   const choices = json && Array.isArray(json.choices) ? json.choices : [];
   const first = choices[0] || {};
   const message = first.message || {};
   let content = message.content;
-  if (Array.isArray(content)) content = content.map((part) => (part && part.text) || "").join("");
-  if (typeof content !== "string") return "";
-  return content.trim();
+  if (Array.isArray(content)) {
+    content = content.map((part) => (part && (part.text || part.content)) || "").join("");
+  }
+  if (typeof content === "string" && content.trim()) return content.trim();
+  for (const key of ["reasoning_content", "reasoning", "thinking"]) {
+    const value = message[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length) return "tool_calls";
+  if (typeof first.text === "string" && first.text.trim()) return first.text.trim();
+  if (typeof json.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
+  return "";
 }
 
-function probeReason(status, json, raw, err) {
-  if (err) return err.name === "TimeoutError" ? "timeout" : String(err.message || err).slice(0, 120);
-  if (!json) return `HTTP ${status} ${String(raw || "").replace(/\s+/g, " ").slice(0, 100)}`;
-  const msg = json.error && (json.error.message || json.error.type) || json.message;
-  return `HTTP ${status}${msg ? " " + String(msg).replace(/\s+/g, " ").slice(0, 100) : ""}`;
+function probeError(json, raw) {
+  const msg =
+    (json && json.error && (json.error.message || json.error.type || json.error.code)) ||
+    (json && (json.message || json.detail)) ||
+    raw;
+  return String(msg || "").replace(/\s+/g, " ").slice(0, 160);
+}
+
+function retryAfterMs(headers) {
+  const value = headers && headers.get ? headers.get("retry-after") : null;
+  if (!value) return null;
+  const secs = Number(value);
+  if (Number.isFinite(secs) && secs >= 0) return secs * 1000;
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  return null;
 }
 
 async function probeOne(model) {
-  const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
-  const attempt = async (maxTokens) => {
-    const started = Date.now();
-    const body = JSON.stringify({
+  const started = Date.now();
+  const url = `${baseURL}/chat/completions`;
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    "User-Agent": `sync-9router-opencode/${VERSION}`,
+  };
+  const prompt = "Reply exactly: PONG";
+
+  const makeBody = (variant, maxTokens) => {
+    const body = {
       model: model.id,
-      messages: [{ role: "user", content: "Reply exactly PONG" }],
-      max_tokens: maxTokens,
-      temperature: 0,
+      messages: [{ role: "user", content: prompt }],
       stream: false,
-    });
+    };
+    if (variant !== "minimal") body.temperature = 0;
+    if (maxTokens) {
+      if (variant === "max_completion_tokens") body.max_completion_tokens = maxTokens;
+      else body.max_tokens = maxTokens;
+    }
+    return body;
+  };
+
+  const attempt = async (body) => {
     let status = 0;
-    let raw = "";
+    let text = "";
     let json = null;
+    let responseHeaders = null;
+    let err = null;
     try {
-      const res = await fetch(`${baseURL}/chat/completions`, {
+      const res = await fetch(url, {
         method: "POST",
         headers,
-        body,
+        body: JSON.stringify(body),
         signal: AbortSignal.timeout(opts.probeTimeout * 1000),
       });
       status = res.status;
-      raw = await res.text();
-      try { json = raw ? JSON.parse(raw) : null; } catch (_) {}
-    } catch (err) {
-      return { ok: false, reason: probeReason(0, null, "", err), ms: Date.now() - started };
+      responseHeaders = res.headers;
+      text = await res.text();
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch (_) {}
+    } catch (e) {
+      err = e;
     }
-
-    if (status < 200 || status >= 300) {
-      return { ok: false, reason: probeReason(status, json, raw), ms: Date.now() - started };
-    }
-    const content = extractContent(json);
-    if (content) {
-      return { ok: true, content: content.slice(0, 80), ms: Date.now() - started };
-    }
-    const finish = json && json.choices && json.choices[0] && json.choices[0].finish_reason;
-    return {
-      ok: false,
-      empty: finish === "length",
-      reason: "empty response" + (finish ? ` (finish_reason=${finish})` : ""),
-      ms: Date.now() - started,
-    };
+    return { status, text, json, headers: responseHeaders, err, ms: Date.now() - started };
   };
 
-  let result = await attempt(opts.probeMaxTokens);
-  if (result.ok) return result;
-  const retryable = result.empty || /429|50[0-9]|timeout|fetch failed|network/i.test(result.reason);
-  if (retryable) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    result = await attempt(Math.max(512, opts.probeMaxTokens * 3));
+  const classify = (r) => {
+    if (r.err) {
+      const timeout = /timeout|abort/i.test(String(r.err.name || r.err.message));
+      return { kind: "transient", reason: timeout ? "timeout" : String(r.err.message || r.err).slice(0, 120) };
+    }
+    if (r.status >= 200 && r.status < 300) {
+      const content = extractProbeContent(r.json);
+      if (content) return { kind: "ok", content: content.slice(0, 80) };
+      if (r.json && r.json.error) {
+        const msg = probeError(r.json, r.text);
+        return {
+          kind: isPermanentError(msg) ? "permanent" : "transient",
+          reason: `HTTP ${r.status} ${msg}`.trim(),
+        };
+      }
+      const finish = r.json && r.json.choices && r.json.choices[0] && r.json.choices[0].finish_reason;
+      return {
+        kind: finish === "length" ? "empty-length" : "empty",
+        reason: `empty response${finish ? ` (finish_reason=${finish})` : ""}`,
+      };
+    }
+    const msg = probeError(r.json, r.text);
+    const lower = msg.toLowerCase();
+    if (isPermanentError(msg)) {
+      return { kind: "permanent", reason: `HTTP ${r.status} ${msg}`.trim() };
+    }
+    if (r.status === 429) {
+      return { kind: "transient", reason: `HTTP 429 ${msg}`.trim(), retryAfter: retryAfterMs(r.headers) };
+    }
+    if (r.status >= 500) return { kind: "transient", reason: `HTTP ${r.status} ${msg}`.trim() };
+    if (r.status === 400 || r.status === 422) {
+      if (
+        /temperature|max_tokens|max_completion_tokens|unsupported parameter|unknown parameter|unrecognized/i.test(
+          lower
+        )
+      ) {
+        return { kind: "adjust", reason: `HTTP ${r.status} ${msg}`.trim(), msg: lower };
+      }
+      return { kind: "permanent", reason: `HTTP ${r.status} ${msg}`.trim() };
+    }
+    return { kind: "permanent", reason: `HTTP ${r.status} ${msg}`.trim() };
+  };
+
+  let r = await attempt(makeBody("standard", opts.probeMaxTokens));
+  let c = classify(r);
+  if (c.kind === "ok") return { ok: true, kind: "ok", reason: "live", content: c.content, ms: r.ms };
+
+  if (c.kind === "adjust") {
+    let variant = "minimal";
+    if (/max_tokens/.test(c.msg) && !/max_completion_tokens/.test(c.msg)) variant = "max_completion_tokens";
+    else if (/max_completion_tokens/.test(c.msg)) variant = "max_tokens";
+    else if (/temperature/.test(c.msg)) variant = "standard";
+    r = await attempt(makeBody(variant, opts.probeMaxTokens));
+    c = classify(r);
+    if (c.kind === "ok") return { ok: true, kind: "ok", reason: "live", content: c.content, ms: r.ms };
   }
-  return result;
+
+  if (c.kind === "empty-length") {
+    r = await attempt(makeBody("standard", Math.max(512, opts.probeMaxTokens * 8)));
+    c = classify(r);
+    if (c.kind === "ok") return { ok: true, kind: "ok", reason: "live", content: c.content, ms: r.ms };
+  }
+
+  if (c.kind === "transient") {
+    if (c.retryAfter && c.retryAfter > 2000) {
+      return { ok: false, kind: "transient", reason: `${c.reason} (retry-after ${Math.round(c.retryAfter / 1000)}s)`, ms: r.ms };
+    }
+    const wait = c.retryAfter != null ? c.retryAfter : 350 + Math.floor(Math.random() * 250);
+    await new Promise((resolve) => setTimeout(resolve, wait));
+    r = await attempt(makeBody("standard", Math.max(opts.probeMaxTokens, 128)));
+    c = classify(r);
+    if (c.kind === "ok") return { ok: true, kind: "ok", reason: "live after retry", content: c.content, ms: r.ms };
+  }
+
+  return {
+    ok: false,
+    kind: c.kind === "adjust" ? "permanent" : c.kind || "permanent",
+    reason: c.reason || "probe failed",
+    ms: Date.now() - started,
+  };
 }
 
-async function probeModels(models) {
-  const results = new Array(models.length);
+class Semaphore {
+  constructor(limit) {
+    this.limit = Math.max(1, limit);
+    this.free = this.limit;
+    this.queue = [];
+  }
+  async acquire() {
+    if (this.free > 0) {
+      this.free--;
+      return;
+    }
+    await new Promise((resolve) => this.queue.push(resolve));
+  }
+  release() {
+    const next = this.queue.shift();
+    if (next) next();
+    else this.free++;
+  }
+}
+
+// Per-provider limiter that slows down when a provider pushes back (429/503).
+class ProviderLimiter {
+  constructor(limit) {
+    this.max = Math.max(1, limit);
+    this.limit = this.max;
+    this.free = this.limit;
+    this.queue = [];
+    this.cooldownUntil = 0;
+    this.backoff = 0;
+  }
+  async acquire() {
+    while (Date.now() < this.cooldownUntil) {
+      const wait = Math.min(5000, this.cooldownUntil - Date.now());
+      await new Promise((resolve) => setTimeout(resolve, Math.max(50, wait)));
+    }
+    if (this.free > 0) {
+      this.free--;
+      return;
+    }
+    await new Promise((resolve) => this.queue.push(resolve));
+  }
+  release() {
+    const next = this.queue.shift();
+    if (next) next();
+    else this.free++;
+  }
+  slowedDown() {
+    this.limit = Math.max(1, Math.floor(this.limit / 2));
+    this.backoff = this.backoff ? Math.min(15000, this.backoff * 2) : 1000;
+    this.cooldownUntil = Date.now() + this.backoff;
+    while (this.free > this.limit) {
+      const next = this.queue.shift();
+      if (next) next();
+      else this.free--;
+    }
+  }
+  recovered() {
+    this.backoff = Math.max(0, Math.floor(this.backoff / 2));
+    if (this.backoff === 0 && this.limit < this.max) this.limit++;
+  }
+}
+
+const RATE_LIMIT_RE = /429|rate.?limit|too many requests|quota|slow down/i;
+
+async function mapLimit(items, limit, fn) {
   let cursor = 0;
-  const workers = Math.max(1, Math.min(opts.probeConcurrency, models.length));
+  const workers = Math.max(1, Math.min(limit, items.length));
   await Promise.all(
     Array.from({ length: workers }, async () => {
-      while (cursor < models.length) {
-        const index = cursor++;
-        results[index] = await probeOne(models[index]);
+      while (cursor < items.length) {
+        const idx = cursor++;
+        await fn(items[idx], idx);
       }
     })
   );
-  const passed = [];
+}
+
+async function probeModels(models) {
+  if (!models.length) return [];
+  const groups = new Map();
+  for (const model of models) {
+    if (!groups.has(model.providerId)) groups.set(model.providerId, []);
+    groups.get(model.providerId).push(model);
+  }
+  const globalSem = new Semaphore(opts.probeConcurrency);
+  const results = new Map();
+  let done = 0;
+
+  await Promise.all(
+    [...groups.values()].map((group) => {
+      const limiter = new ProviderLimiter(opts.providerConcurrency);
+      return mapLimit(group, opts.providerConcurrency * 2, async (model) => {
+        await limiter.acquire();
+        await globalSem.acquire();
+        try {
+          const result = await probeOne(model);
+          results.set(model.id, result);
+          if (!result.ok && RATE_LIMIT_RE.test(String(result.reason || ""))) {
+            limiter.slowedDown();
+          } else if (result.ok) {
+            limiter.recovered();
+          }
+        } finally {
+          globalSem.release();
+          limiter.release();
+          done++;
+          progress(`Probing ${done}/${models.length}...`);
+        }
+      });
+    })
+  );
+  progressDone();
+  return models.map((model) => ({ model, result: results.get(model.id) || { ok: false, reason: "no result" } }));
+}
+
+function cacheEntryValid(entry, model, ok) {
+  if (!entry || entry.fingerprint !== probeFingerprint(model)) return false;
+  const ttl = ok
+    ? opts.probeTtlHours
+    : entry.kind === "permanent"
+      ? Math.max(opts.probeTtlHours, opts.failTtlHours)
+      : opts.failTtlHours;
+  if (!ttl) return false;
+  return entry.at && Date.now() - entry.at < ttl * 3600 * 1000;
+}
+
+async function runProbe(models, cache, existingModelIds = new Set()) {
+  const plan = [];
+  const trusted = [];
+  const skipped = [];
+  const cachedOk = [];
+  const cachedFail = [];
+  const liveOk = [];
+  const kept = [];
   const dropped = [];
-  models.forEach((model, index) => {
-    const result = results[index] || { ok: false, reason: "no result" };
-    if (result.ok) passed.push(model);
-    else dropped.push({ id: model.id, reason: result.reason, ms: result.ms });
+  const stats = new Map();
+  const permanentIds = new Set();
+  const note = (model, field) => {
+    const key = model.providerId;
+    if (!stats.has(key)) {
+      stats.set(key, { considered: 0, passed: 0, kept: 0, permanent: 0, transient: 0 });
+    }
+    stats.get(key).considered++;
+    stats.get(key)[field]++;
+  };
+
+  const keepIfExisting = (model, reason, kind, source) => {
+    if (kind === "permanent") return false;
+    if (!existingModelIds.has(model.id)) return false;
+    kept.push({ model, reason, kind, source });
+    return true;
+  };
+
+  for (const model of models) {
+    if (!opts.probe) {
+      trusted.push(model);
+      continue;
+    }
+    if (opts.useCache && !opts.refresh) {
+      const entry = cache.probes[model.id];
+      if (cacheEntryValid(entry, model, true) && entry.ok) {
+        cachedOk.push(model);
+        note(model, "passed");
+        continue;
+      }
+      if (cacheEntryValid(entry, model, false) && !entry.ok) {
+        cachedFail.push(model);
+        const kind = entry.kind || (isTransientReason(entry.reason) ? "transient" : "permanent");
+        const reason = `cached: ${entry.reason || "failed"}`;
+        if (keepIfExisting(model, reason, kind, "cache")) {
+          note(model, "kept");
+        } else {
+          dropped.push({ id: model.id, reason, source: "cache", kind });
+          note(model, kind === "permanent" ? "permanent" : "transient");
+          if (kind === "permanent") permanentIds.add(model.id);
+        }
+        continue;
+      }
+    }
+    plan.push(model);
+  }
+
+  if (plan.length) {
+    info(`Probing ${plan.length} model(s) with ${opts.probeConcurrency} worker(s)...`);
+    const results = await probeModels(plan);
+    for (const { model, result } of results) {
+      const kind = result.ok
+        ? "ok"
+        : result.kind || (isTransientReason(result.reason) ? "transient" : "permanent");
+      cache.probes[model.id] = {
+        ok: !!result.ok,
+        kind,
+        at: Date.now(),
+        ms: result.ms || 0,
+        reason: result.ok ? "" : String(result.reason || "failed").slice(0, 200),
+        fingerprint: probeFingerprint(model),
+      };
+      if (result.ok) {
+        liveOk.push(model);
+        note(model, "passed");
+      } else {
+        const reason = result.reason || "failed";
+        if (keepIfExisting(model, reason, kind, "live")) {
+          note(model, "kept");
+        } else {
+          dropped.push({ id: model.id, reason, source: "live", kind, ms: result.ms });
+          note(model, kind === "permanent" ? "permanent" : "transient");
+          if (kind === "permanent") permanentIds.add(model.id);
+        }
+      }
+    }
+  }
+
+  return {
+    passed: [...cachedOk, ...liveOk, ...trusted, ...skipped],
+    trusted,
+    skipped,
+    cachedOk,
+    cachedFail,
+    liveOk,
+    kept,
+    dropped,
+    stats,
+    permanentIds,
+    tested: plan.length,
+    livePassed: liveOk.length,
+  };
+}
+
+function countSources(models) {
+  const context = {};
+  const output = {};
+  for (const model of models) {
+    context[model.contextSource] = (context[model.contextSource] || 0) + 1;
+    output[model.outputSource] = (output[model.outputSource] || 0) + 1;
+  }
+  return { context, output };
+}
+
+function validateDefault(config) {
+  const value = config.model;
+  if (!value || typeof value !== "string" || !value.includes("/")) return { value, valid: null };
+  const providerId = value.slice(0, value.indexOf("/"));
+  const key = value.slice(value.indexOf("/") + 1);
+  const provider = (config.providers || {})[providerId];
+  if (!provider) return { value, valid: false };
+  const models = provider.models || {};
+  if (models[key]) return { value, valid: true };
+  const byId = Object.values(models).some((entry) => entry && entry.modelID === value);
+  return { value, valid: byId };
+}
+
+function countBy(items, keyFn) {
+  const counts = new Map();
+  for (const item of items) {
+    const key = keyFn(item);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([key, n]) => `${key} ${n}`)
+    .join(", ");
+}
+
+function keptByProvider(details) {
+  return countBy(details, (item) => String(item.id).split("/")[0]);
+}
+
+function droppedByReason(details) {
+  return countBy(details, (item) => {
+    const reason = String(item.reason || "");
+    if (/429|rate.?limit/i.test(reason)) return "rate-limit";
+    if (/402|insufficient|free tier|quota/i.test(reason)) return "paid/quota";
+    if (/410|deprecat|unavailable|not found|404/i.test(reason)) return "unavailable";
+    if (/timeout/i.test(reason)) return "timeout";
+    if (/400|422|unsupported/i.test(reason)) return "unsupported";
+    return "error";
   });
-  return { passed, dropped };
+}
+
+function printSummary(summary, models) {
+  info("");
+  for (const provider of summary.providers) {
+    info(`  ✓ ${provider.name.padEnd(24)} ${String(provider.models).padStart(3)} model(s)`);
+  }
+  if (!summary.probe.enabled) {
+    info("");
+    info("Probe disabled: catalog models were trusted without testing.");
+    return;
+  }
+  const trusted = summary.probe.trusted;
+  info("");
+  info(
+    `Probe: ${summary.probe.tested} tested, ${summary.probe.live} live` +
+      (summary.probe.cached ? `, ${summary.probe.cached} cached` : "") +
+      (trusted ? `, ${trusted} trusted` : "") +
+      (summary.probe.kept ? `, ${summary.probe.kept} kept` : "") +
+      (summary.probe.dropped ? `, ${summary.probe.dropped} dropped` : "")
+  );
+  if (summary.probe.kept) {
+    info(`  ${summary.probe.kept} existing model(s) kept (transient failure): ${keptByProvider(summary.probe.keptDetails)}`);
+  }
+  if (summary.probe.dropped) {
+    info(`  ${summary.probe.dropped} model(s) dropped: ${droppedByReason(summary.probe.droppedDetails)}`);
+  }
+  if (opts.verbose) {
+    for (const item of summary.probe.keptDetails) info(`  ~ ${item.id} — ${item.reason}`);
+    for (const item of summary.probe.droppedDetails) info(`  ✗ ${item.id} — ${item.reason}`);
+  }
+  info("");
+  info("Changes");
+  if (summary.changes.configChanged) {
+    info(
+      `  +${summary.changes.modelsAdded.length} / -${summary.changes.modelsRemoved.length} model(s), ` +
+        `+${summary.changes.providersAdded.length} / -${summary.changes.providersRemoved.length} provider(s)`
+    );
+  } else {
+    info("  No changes: config already up to date.");
+  }
+  const keptProviders = summary.changes.providersKept || [];
+  if (keptProviders.length) {
+    info(`  ! Left unchanged (missing from catalog, node alive): ${keptProviders.join(", ")}`);
+  }
+  if (summary.wrote) info(`  Wrote: ${summary.configPath}`);
+  if (summary.backup) info(`  Backup: ${summary.backup}`);
+  if (summary.defaultModel && summary.defaultModel.valid === false) {
+    info(`  ! Default model "${summary.defaultModel.value}" is no longer available.`);
+  }
 }
 
 async function main() {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) return printHelp();
-  if (process.argv.includes("--version") || process.argv.includes("-v")) {
-    console.log(`sync-9router-opencode ${VERSION}`);
-    return;
-  }
+  const raw = parseArgs(process.argv.slice(2));
+  if (raw.help) return printHelp();
+  if (raw.version) return console.log(`sync-9router-opencode ${VERSION}`);
 
-  opts = normalizeOptions(parseArgs(process.argv.slice(2)));
-
-  const router = normalizeRouter(opts.router || process.env.ROUTER_BASE_URL || `http://localhost:${DEFAULT_PORT}`);
+  opts = normalizeOptions(raw);
+  const router = normalizeRouter(opts.router || process.env.ROUTER_BASE_URL || "http://localhost:20128");
   baseURL = router.baseURL;
-  apiBase = String(opts.apiBase || process.env.ROUTER_API_BASE || router.apiBase).replace(/\/+$/, "");
-  dbPath = path.resolve(expandHome(opts.db || DEFAULTS.dbPath));
-  configPath = path.resolve(expandHome(opts.config || findConfigPath()));
-  statePath = path.join(path.dirname(configPath), STATE_BASENAME);
-  limitOverrides = readLimitOverrides(path.join(path.dirname(configPath), LIMITS_BASENAME));
+  apiBase = String(process.env.ROUTER_API_BASE || router.apiBase).replace(/\/+$/, "");
+  dbPath = path.resolve(expandHome(process.env.ROUTER_DB_PATH || DEFAULTS.dbPath));
 
-  apiKey = String(opts.apiKey || process.env.ROUTER_API_KEY || "").trim();
-  if (!apiKey) {
-    try { apiKey = getApiKeyFromDb() || ""; }
-    catch (err) { throw new Error(`Could not read 9router API key from ${dbPath}: ${err.message}`); }
+  let configuredPath = opts.config || findConfigPath();
+  configuredPath = path.resolve(expandHome(configuredPath));
+  if (fs.existsSync(configuredPath) && fs.statSync(configuredPath).isDirectory()) {
+    configuredPath = path.join(configuredPath, "opencode.json");
   }
-  if (!apiKey) throw new Error("No 9router API key found. Pass --api-key or set ROUTER_API_KEY.");
+  configPath = configuredPath;
+  statePath = path.join(path.dirname(configPath), STATE_BASENAME);
+  cachePath = path.join(path.dirname(configPath), CACHE_BASENAME);
+  limitOverrides = loadLimitOverrides(path.join(path.dirname(configPath), LIMITS_BASENAME));
 
   info(`Router: ${baseURL}`);
   info(`Config: ${configPath}`);
 
-  const state = loadState();
-  const existing = loadConfig();
-  const existingProviders = existing.config.providers || {};
+  apiKey = String(process.env.ROUTER_API_KEY || "").trim();
+  if (!apiKey) {
+    try {
+      apiKey = getApiKeyFromDb() || "";
+    } catch (err) {
+      throw new Error(`Could not read 9router API key from ${dbPath}: ${err.message}`);
+    }
+  }
+  if (!apiKey) throw new Error("No 9router API key found. Set ROUTER_API_KEY or check the DB.");
 
-  const [catalogRaw, nodesRaw, apiModelsRaw, availabilityRaw] = await Promise.all([
-    fetchJson(`${baseURL}${opts.modelsPath || DEFAULTS.modelsPath}`),
-    fetchJson(`${apiBase}${opts.providerNodesPath || DEFAULTS.providerNodesPath}`, 15000, false),
-    fetchJson(`${apiBase}${opts.apiModelsPath || DEFAULTS.apiModelsPath}`, 60000, false),
-    fetchJson(`${apiBase}${opts.availabilityPath || DEFAULTS.availabilityPath}`, 15000, false),
+  const existing = loadConfig();
+  const state = loadState(existing.config);
+  const cache = loadCache();
+  global.__existingConfig = existing.config;
+  global.__managedIds = state.managedIds;
+
+  const catalogStart = Date.now();
+  const [nodesResult, apiModelsRaw] = await Promise.all([
+    loadNodes(),
+    opts.useApiModels
+      ? fetchJson(`${apiBase}${DEFAULTS.apiModelsPath}`, { timeout: 30000, required: false })
+      : Promise.resolve(null),
   ]);
 
-  const catalog = catalogRaw && Array.isArray(catalogRaw.data) ? catalogRaw.data : null;
-  if (!catalog) throw new Error(`Unexpected response from ${baseURL}${opts.modelsPath || DEFAULTS.modelsPath}`);
-
-  const nodes = nodesRaw && Array.isArray(nodesRaw.nodes) ? nodesRaw.nodes : [];
   const apiModels = apiModelsRaw && Array.isArray(apiModelsRaw.models) ? apiModelsRaw.models : [];
-  const availabilityRows = availabilityRaw && Array.isArray(availabilityRaw.models) ? availabilityRaw.models : [];
+  const apiIndex = buildApiModelIndex(apiModels);
+  const availability = buildAvailability();
+  if (availability.pending) await loadAvailability(availability.byModel, availability.byPrefix);
 
-  const nodeById = new Map();
-  const nodeByPrefix = new Map();
-  for (const node of nodes) {
-    if (!node || !node.id) continue;
-    nodeById.set(String(node.id), node);
-    if (node.prefix) nodeByPrefix.set(String(node.prefix).toLowerCase(), node);
-  }
-
-  const upstreamMeta = await getUpstreamModelMeta(nodes);
-  if (upstreamMeta.size) info(`Upstream metadata: ${upstreamMeta.size} model(s)`);
-
-  const existingById = new Map();
-  const prefixToExistingId = new Map();
-  for (const [id, provider] of Object.entries(existingProviders)) {
-    existingById.set(id, provider);
-    for (const model of Object.values((provider && provider.models) || {})) {
-      const modelID = model && typeof model.modelID === "string" ? model.modelID : null;
-      if (!modelID || !modelID.includes("/")) continue;
-      const prefix = modelID.slice(0, modelID.indexOf("/"));
-      if (!prefixToExistingId.has(prefix)) prefixToExistingId.set(prefix, id);
-    }
-  }
-
-  const apiInfoByRoutableId = new Map();
-  for (const entry of apiModels) {
-    if (!entry || !entry.provider) continue;
-    const node = nodeById.get(String(entry.provider));
-    const prefix = node && node.prefix ? String(node.prefix) : String(entry.provider);
-    const model = entry.model || entry.alias;
-    if (!model) continue;
-    const info = { name: entry.name, caps: entry.caps || {} };
-    const keys = [`${prefix}/${model}`];
-    for (const full of [entry.fullModel, entry.routedModel]) {
-      if (typeof full === "string" && full.includes("/")) keys.push(`${prefix}/${full.slice(full.indexOf("/") + 1)}`);
-    }
-    for (const key of [...new Set(keys)]) {
-      if (!apiInfoByRoutableId.has(key)) apiInfoByRoutableId.set(key, info);
-    }
-  }
-
-  const availabilityByModel = new Map();
-  const availabilityByProvider = new Map();
-  for (const row of availabilityRows) {
-    if (!row || !row.provider) continue;
-    const node = nodeById.get(String(row.provider));
-    const prefix = node && node.prefix ? String(node.prefix) : String(row.provider);
-    const entry = { status: row.status || "unavailable", lastError: row.lastError || "" };
-    if (row.model && row.model !== "__all") availabilityByModel.set(`${prefix}/${row.model}`, entry);
-    else {
-      if (!availabilityByProvider.has(prefix)) availabilityByProvider.set(prefix, []);
-      availabilityByProvider.get(prefix).push(entry);
-    }
-  }
-
-  const providerCache = new Map();
-  function resolveProvider(prefix) {
-    const key = String(prefix).toLowerCase();
-    if (providerCache.has(key)) return providerCache.get(key);
-    const node = nodeByPrefix.get(key);
-    const existingId = prefixToExistingId.get(String(prefix)) || prefixToExistingId.get(key);
-    const existingProvider = existingId ? existingById.get(existingId) : null;
-    const name = (node && node.name) || (existingProvider && existingProvider.name) || humanize(prefix);
-    const meta = { id: existingId || sanitizeProviderId(prefix), name, prefix: String(prefix) };
-    providerCache.set(key, meta);
-    return meta;
-  }
-
+  const selectedStart = Date.now();
+  let catalog = [];
   let models = [];
-  const unavailable = [];
-  for (const raw of catalog) {
-    const id = raw && typeof raw.id === "string" ? raw.id : null;
-    if (!id || !id.includes("/")) continue;
-    const prefix = id.slice(0, id.indexOf("/"));
-    const modelPart = id.slice(prefix.length + 1);
-    const meta = resolveProvider(prefix);
+  let preDropped = [];
+  let catalogFromCache = false;
 
-    if (!providerMatches(meta, opts.provider)) continue;
-    if (opts.exclude.length && providerMatches(meta, opts.exclude)) continue;
-    if (opts.model.length && !matchesAny(id, opts.model) && !matchesAny(modelPart, opts.model)) continue;
-    if (opts.excludeModel.length && (matchesAny(id, opts.excludeModel) || matchesAny(modelPart, opts.excludeModel))) continue;
+  const fetchCatalog = async () => {
+    const raw = await fetchJson(`${baseURL}${DEFAULTS.modelsPath}`, {
+      timeout: 30000,
+      required: true,
+    });
+    return raw && Array.isArray(raw.data) ? raw.data : [];
+  };
 
-    const health = availabilityByModel.get(id);
-    if (health && isPermanentError(health.lastError)) {
-      unavailable.push({ id, reason: health.lastError });
-      continue;
-    }
-
-    const apiInfo = apiInfoByRoutableId.get(id);
-    const caps = { ...(apiInfo ? apiInfo.caps : {}), ...(raw.capabilities || {}) };
-    let context =
-      caps.contextWindow != null ? caps.contextWindow :
-      apiInfo && apiInfo.caps && apiInfo.caps.contextWindow != null ? apiInfo.caps.contextWindow :
-      raw.context_length != null ? raw.context_length : raw.context_window;
-    let output =
-      caps.maxOutput != null ? caps.maxOutput :
-      apiInfo && apiInfo.caps && apiInfo.caps.maxOutput != null ? apiInfo.caps.maxOutput :
-      raw.max_completion_tokens;
-    let contextSource = "router";
-
-    const upstream = upstreamMeta.get(id);
-    if (upstream) {
-      if (upstream.context != null) {
-        context = upstream.context;
-        contextSource = "upstream";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      catalog = await fetchCatalog();
+      if (catalog.length) {
+        ({ models, dropped: preDropped } = buildModelList(catalog, apiIndex, availability));
+        if (models.length) break;
       }
-      if (upstream.output != null) output = upstream.output;
+    } catch (err) {
+      verbose(`(catalog) ${err.message}`);
     }
-
-    models.push({
-      id,
-      prefix,
-      modelPart,
-      providerId: meta.id,
-      providerName: meta.name,
-      name: chooseModelName(apiInfo, modelPart),
-      caps,
-      context,
-      output,
-      contextSource,
-    });
-  }
-
-  if (opts.limit) {
-    const counts = new Map();
-    models = models.filter((model) => {
-      const n = counts.get(model.providerId) || 0;
-      if (n >= opts.limit) return false;
-      counts.set(model.providerId, n + 1);
-      return true;
-    });
-  }
-
-  if (!models.length && !opts.allowEmpty) {
-    throw new Error("No models matched. Check provider/model filters.");
-  }
-
-  let probeResult = null;
-  if (opts.probe) {
-    const shouldProbe = (model) =>
-      !opts.probeSkip.length ||
-      !providerMatches({ id: model.providerId, prefix: model.prefix, name: model.providerName }, opts.probeSkip);
-    const skipped = models.filter((model) => !shouldProbe(model));
-    const targets = models.filter(shouldProbe);
-    info(`Probing ${targets.length} model(s) with ${opts.probeConcurrency} worker(s)${skipped.length ? `, trusting ${skipped.length} skipped` : ""}...`);
-    probeResult = await probeModels(targets);
-    if (skipped.length) {
-      verbose(`Trusted ${skipped.length} skipped model(s) without probing`);
-    }
-    models = [...skipped, ...probeResult.passed];
-    verbose(`Probe kept ${probeResult.passed.length}/${targets.length}, dropped ${probeResult.dropped.length}`);
-    if (!models.length && !opts.allowEmpty) {
-      throw new Error("No models responded to the live probe. Nothing written.");
+    if (attempt < 1) {
+      await new Promise((resolve) => setTimeout(resolve, 400));
     }
   }
 
-  const generated = buildProviders(models, existingProviders);
-  const merged = mergeConfig(existing.config, generated, state);
-  const managedCount = countManagedModels(merged.config, merged.managedIds);
-  if (managedCount < opts.minModels && !opts.allowEmpty) {
-    throw new Error(`Only ${managedCount} model(s) would remain, below --min-models ${opts.minModels}. Nothing written.`);
+  if (!models.length && opts.useCache && cache.catalog && cache.catalog.data.length) {
+    const age = Date.now() - (cache.catalog.at || 0);
+    if (age < 60 * 60 * 1000) {
+      catalog = cache.catalog.data;
+      catalogFromCache = true;
+      ({ models, dropped: preDropped } = buildModelList(catalog, apiIndex, availability));
+      warn(`Warning: router catalog unavailable, using cached catalog (${Math.round(age / 60000)}m old).`);
+    }
   }
 
-  if (!merged.config.$schema) merged.config.$schema = opts.schema || DEFAULTS.schema;
+  if (!catalog.length) throw new Error(`Unexpected response from ${baseURL}${DEFAULTS.modelsPath}`);
+  if (!models.length) {
+    throw new Error("No models matched. Check --provider/--model or the router catalog.");
+  }
+  if (!catalogFromCache && opts.useCache) {
+    cache.catalog = { at: Date.now(), data: catalog };
+  }
+  const catalogMs = elapsed(catalogStart);
+  const selectionMs = elapsed(selectedStart);
+  verbose(`Catalog: ${catalog.length} model(s), selected ${models.length}${catalogFromCache ? " (cached)" : ""}`);
 
-  const changed = JSON.stringify(existing.config || {}) !== JSON.stringify(merged.config || {});
-  let backup = null;
-  if (!opts.dryRun) {
-    if (changed) {
-      if (opts.backup) backup = backupFile(configPath);
-      atomicWrite(configPath, `${JSON.stringify(merged.config, null, 2)}\n`);
-    }
-    atomicWrite(
-      statePath,
-      `${JSON.stringify(
-        {
-          version: 4,
-          format: "v2",
-          router: baseURL,
-          updatedAt: new Date().toISOString(),
-          providerIds: [...merged.managedIds],
-          models: Object.fromEntries(
-            [...merged.managedIds].map((id) => [id, Object.keys(((merged.config.providers || {})[id] || {}).models || {})])
-          ),
-        },
-        null,
-        2
-      )}\n`
+  const metadataStart = Date.now();
+  const upstream = await loadUpstreamMetadata(models, cache);
+  applyLimits(models, upstream.map);
+  const metadataMs = elapsed(metadataStart);
+  if (upstream.stats.models) {
+    verbose(
+      `Upstream metadata: ${upstream.stats.models} model(s) ` +
+        `(${upstream.stats.fetched} fetched, ${upstream.stats.cached} cached, ` +
+        `${upstream.stats.stale} stale, ${upstream.stats.failed} failed)`
     );
   }
 
-  const generatedIds = new Set(Object.keys(generated));
-  const providersSummary = [...merged.managedIds]
-    .filter((id) => generatedIds.has(id) && merged.config.providers[id])
+  const existingModelIds = new Set();
+  for (const provider of Object.values(existing.config.providers || {})) {
+    for (const entry of Object.values((provider && provider.models) || {})) {
+      if (entry && typeof entry.modelID === "string") existingModelIds.add(entry.modelID);
+    }
+  }
+
+  const probeStart = Date.now();
+  const probe = await runProbe(models, cache, existingModelIds);
+  const probeMs = elapsed(probeStart);
+  if (!probe.passed.length && !probe.kept.length) {
+    throw new Error("No models responded. Nothing written.");
+  }
+
+  global.__probeStats = probe.stats;
+  global.__permanentIds = probe.permanentIds;
+  const keptIds = new Set(probe.kept.map((item) => item.model.id));
+  const keptModels = probe.kept.map((item) => item.model);
+  const usableModels = [...probe.passed, ...keptModels];
+  const generated = buildProviders(usableModels, existing.config.providers || {}, keptIds);
+  const merged = mergeConfig(existing.config, generated, state);
+  const limitSources = countSources(usableModels);
+
+  const managedModelCount = [...merged.managedIds].reduce((n, id) => {
+    const p = merged.config.providers && merged.config.providers[id];
+    return n + (p && p.models ? Object.keys(p.models).length : 0);
+  }, 0);
+  if (!managedModelCount) throw new Error("No managed models would remain. Nothing written.");
+
+  if (!merged.config.$schema) merged.config.$schema = DEFAULTS.schema;
+
+  const changed = JSON.stringify(existing.config || {}) !== JSON.stringify(merged.config || {});
+  let backup = null;
+  let wrote = false;
+  if (!opts.dryRun && changed) {
+    if (opts.backup) backup = backupFile(configPath);
+    atomicWrite(configPath, `${JSON.stringify(merged.config, null, 2)}\n`);
+    wrote = true;
+  }
+
+  const nextState = buildState(merged.managedIds, merged.config);
+  const prevStateComparable = state.raw
+    ? JSON.stringify({ providerIds: state.raw.providerIds, providers: state.raw.providers })
+    : "";
+  const nextStateComparable = JSON.stringify({
+    providerIds: nextState.providerIds,
+    providers: nextState.providers,
+  });
+  if (!opts.dryRun && prevStateComparable !== nextStateComparable) {
+    atomicWrite(statePath, `${JSON.stringify(nextState, null, 2)}\n`);
+  }
+
+  const cacheWrote = saveCache(cache, new Set(catalog.map((m) => m.id).filter(Boolean)));
+
+  const added = [...merged.after.keys()].filter((id) => !merged.before.has(id));
+  const removed = [...merged.before.keys()].filter((id) => !merged.after.has(id));
+  const updated = [...merged.after.keys()].filter(
+    (id) => merged.before.has(id) && merged.before.get(id) !== merged.after.get(id)
+  );
+  const providersAdded = [...merged.providersAfter].filter((id) => !merged.providersBefore.has(id));
+  const providersRemoved = [...merged.providersBefore].filter((id) => !merged.providersAfter.has(id));
+  const providers = [...merged.managedIds]
+    .filter((id) => merged.config.providers && merged.config.providers[id])
     .map((id) => ({
       id,
       name: merged.config.providers[id].name || id,
@@ -1140,91 +2097,80 @@ async function main() {
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 
-  const limitSources = {};
-  for (const model of models) {
-    const source = contextSourceFor(model);
-    limitSources[source] = (limitSources[source] || 0) + 1;
-  }
-
   const summary = {
     ok: true,
     version: VERSION,
     router: baseURL,
     configPath,
+    statePath,
+    cachePath,
     dryRun: opts.dryRun,
-    source: "9router-api",
-    providers: providersSummary,
-    limits: { sources: limitSources, upstreamModels: upstreamMeta.size },
-    probe: probeResult
-      ? {
-          enabled: true,
-          tested: models.length + probeResult.dropped.length,
-          passed: models.length,
-          dropped: probeResult.dropped.length,
-          skipped: models.filter((m) => opts.probeSkip.length && providerMatches({ id: m.providerId, prefix: m.prefix, name: m.providerName }, opts.probeSkip)).length,
-          details: probeResult.dropped,
-        }
-      : { enabled: false },
-    unavailable,
-    wrote: !opts.dryRun && changed,
+    source: "9router",
+    filters: { provider: opts.provider, model: opts.model },
+    catalog: catalog.length,
+    selected: models.length,
+    providers,
+    probe: {
+      enabled: opts.probe,
+      tested: probe.tested,
+      passed: probe.passed.length,
+      live: probe.livePassed,
+      cached: probe.cachedOk.length,
+      cachedFailed: probe.cachedFail.length,
+      skipped: probe.skipped.length,
+      trusted: probe.trusted.length,
+      kept: probe.kept.length,
+      keptDetails: probe.kept.map((item) => ({
+        id: item.model.id,
+        reason: item.reason,
+        kind: item.kind,
+        source: item.source,
+      })),
+      dropped: preDropped.length + probe.dropped.length,
+      droppedDetails: [...preDropped, ...probe.dropped],
+    },
+    limits: { context: limitSources.context, output: limitSources.output, upstream: upstream.stats },
+    changes: {
+      configChanged: changed,
+      modelsAdded: added,
+      modelsRemoved: removed,
+      modelsUpdated: updated,
+      providersAdded,
+      providersRemoved,
+      providersKept: merged.keptProviders || [],
+    },
+    wrote,
     backup,
+    stateWrote: !opts.dryRun && prevStateComparable !== nextStateComparable,
+    cacheWrote,
+    defaultModel: validateDefault(merged.config),
+    timing: {
+      catalogMs,
+      selectionMs,
+      metadataMs,
+      probeMs,
+      totalMs: elapsed(),
+    },
   };
 
   if (opts.json) {
-    if (opts.showContext) {
-      summary.context = models.map((m) => ({
-        id: m.id,
-        context: m.context,
-        output: m.output,
-        source: contextSourceFor(m),
-      }));
-    }
     console.log(JSON.stringify(summary, null, 2));
   } else {
-    if (opts.showContext) {
-      info("");
-      info("Context window:");
-      for (const m of models) {
-        info(`  ${m.id.padEnd(46)} ${String(m.context ?? "-").padStart(9)} / out ${String(m.output ?? "-").padStart(7)}  [${contextSourceFor(m)}]`);
-      }
-    }
-    if (probeResult) {
-      info("");
-      const tested = models.length + probeResult.dropped.length;
-      info(`Probe: ${probeResult.passed.length}/${probeResult.passed.length + probeResult.dropped.length} tested model(s) responded, ${probeResult.dropped.length} dropped${probeResult.skipped ? `, ${probeResult.skipped} trusted without probing` : ""}`);
-      const limit = opts.showDropped ? probeResult.dropped.length : Math.min(20, probeResult.dropped.length);
-      for (const item of probeResult.dropped.slice(0, limit)) {
-        info(`  ✗ ${item.id} — ${item.reason}`);
-      }
-      if (!opts.showDropped && probeResult.dropped.length > limit) {
-        info(`  ... and ${probeResult.dropped.length - limit} more (use --show-dropped)`);
-      }
-    }
-    info("");
-    for (const p of providersSummary) info(`  ✓ ${p.name.padEnd(24)} ${String(p.models).padStart(3)} model(s)`);
-    if (unavailable.length || opts.showUnavailable) {
-      info("");
-      info("  Dropped permanently unavailable model(s):");
-      for (const item of unavailable) info(`    ✗ ${item.id} ${String(item.reason).slice(0, 90)}`);
-    }
-    if (opts.showUnavailable) {
-      for (const [prefix, rows] of availabilityByProvider) {
-        const down = rows.filter((r) => r.status === "unavailable");
-        if (down.length) info(`  ! ${prefix}: ${down.length} unavailable connection(s)`);
-      }
-    }
-    const total = providersSummary.reduce((n, p) => n + p.models, 0);
     info("");
     info("Summary");
-    info(`  ${total} model(s) across ${providersSummary.length} provider(s)`);
-    if (opts.dryRun) info("  Dry-run: no files were written.");
-    else if (changed) info(`  Wrote: ${configPath}`);
-    else info("  No changes: config already up to date.");
+    info(`  ${summary.providers.reduce((n, p) => n + p.models, 0)} model(s) across ${summary.providers.length} provider(s)`);
+    printSummary(summary, usableModels);
+    info(`  Time: ${summary.timing.totalMs} ms`);
+    if (opts.dryRun) info("  Dry-run: nothing written.");
   }
 
   if (!opts.dryRun && opts.reload && changed) {
     try {
-      const out = execFileSync("opencode", ["reload"], { encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
+      const out = execFileSync("opencode", ["reload"], {
+        encoding: "utf8",
+        timeout: 30000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
       const text = String(out || "").trim();
       if (text) info(`\n${text}`);
     } catch (err) {

@@ -6,70 +6,84 @@
 |---|---|
 | OpenCode config | `$XDG_CONFIG_HOME/opencode/opencode.json` or `~/.config/opencode/opencode.json` |
 | Sync state | `<config dir>/.9router-sync-state.json` |
-| Limit override | `<config dir>/.9router-sync-limits.json` |
+| Sync cache | `<config dir>/.9router-sync-cache.json` |
+| Limit overrides | `<config dir>/.9router-sync-limits.json` |
 | 9router DB | `~/.9router/db/data.sqlite` |
 
-All of these can be changed with CLI flags or environment variables.
+## CLI flags
+
+| Flag | Purpose |
+|---|---|
+| `-h, --help` | Help |
+| `-v, --version` | Version |
+| `-n, --dry-run` | Build and probe without writing |
+| `--config <path>` | OpenCode config path (file or its directory) |
+| `--router <url>` | 9router URL |
+| `--provider <list>` | Only touch matching providers |
+| `--model <glob>` | Only touch matching model IDs |
+| `--no-probe` | Trust the catalog without live testing |
+| `--refresh` | Ignore caches for this run |
+| `--json` | Machine-readable report |
+| `--quiet` | Errors and warnings only |
+| `--verbose` | Explain decisions |
+
+Tuning that almost nobody needs lives in the environment, not in flags.
 
 ## Environment variables
 
-| Variable | Purpose |
-|---|---|
-| `ROUTER_PORT` | Default 9router port, `20128` |
-| `ROUTER_BASE_URL` | Full router URL |
-| `ROUTER_API_KEY` | Router key, replaces DB lookup |
-| `ROUTER_API_BASE` | Router API base without `/v1` |
-| `ROUTER_DB_PATH` | SQLite DB path |
-| `ROUTER_DB_KEY_QUERY` | SQL query for the router key |
-| `ROUTER_DB_NODES_QUERY` | SQL query for provider connection keys |
-| `ROUTER_UPSTREAM_TIMEOUT` | Upstream metadata timeout in seconds |
-| `ROUTER_PROBE_TIMEOUT` | Live probe timeout in seconds |
-| `ROUTER_PROBE_CONCURRENCY` | Parallel probe workers |
-| `ROUTER_PROBE_MAX_TOKENS` | Output token budget for the probe |
-| `ROUTER_MODELS_PATH` | Override `/v1/models` |
-| `ROUTER_API_MODELS_PATH` | Override `/api/models` |
-| `ROUTER_PROVIDER_NODES_PATH` | Override `/api/provider-nodes` |
-| `ROUTER_AVAILABILITY_PATH` | Override `/api/models/availability` |
-| `OPENCODE_COMPATIBLE_PACKAGE` | OpenCode provider package |
-| `OPENCODE_SCHEMA` | Config `$schema` URL |
+| Variable | Default | Purpose |
+|---|---|---|
+| `ROUTER_BASE_URL` | `http://localhost:20128` | Router base URL |
+| `ROUTER_API_BASE` | derived | Router API base (without `/v1`) |
+| `ROUTER_API_KEY` | from DB | Router key |
+| `ROUTER_DB_PATH` | `~/.9router/db/data.sqlite` | SQLite path |
+| `ROUTER_PROBE_TIMEOUT` | `10` | Per-request probe timeout (s) |
+| `ROUTER_PROBE_CONCURRENCY` | `16` | Global probe workers |
+| `ROUTER_PROBE_PER_PROVIDER` | `3` | Workers per provider |
+| `ROUTER_PROBE_MAX_TOKENS` | `64` | Probe output budget |
+| `ROUTER_PROBE_TTL` | `12` | Successful probe cache TTL (hours) |
+| `ROUTER_FAIL_TTL` | `1` | Transient failure cache TTL (hours) |
+| `ROUTER_METADATA_TTL` | `12` | Upstream metadata cache TTL (hours) |
+| `ROUTER_UPSTREAM_TIMEOUT` | `8` | Upstream `/models` timeout (s) |
+| `ROUTER_NO_UPSTREAM=1` | off | Skip upstream context lookups |
+| `ROUTER_API_MODELS=1` | off | Use `/api/models` for display names/caps |
+| `ROUTER_AVAILABILITY=1` | off | Use `/api/models/availability` |
+| `ROUTER_NO_CACHE=1` | off | Disable probe/metadata cache |
+| `ROUTER_NO_PROGRESS=1` | off | Disable progress line |
+| `ROUTER_DEBUG=1` | off | Verbose logging |
+| `OPENCODE_COMPATIBLE_PACKAGE` | `@opencode/ai/providers/openai-compatible` | Provider package |
+| `OPENCODE_SCHEMA` | `https://opencode.ai/config.json` | Config `$schema` |
 
-## Limit override
+## Limit overrides
 
-The override file is a JSON object keyed by the full router `modelID`:
+Keyed by the full router model ID, or nested by provider:
 
 ```json
 {
-  "centai/hy4-flash:free": {
-    "context": 1048576,
-    "output": 64000
+  "centai/hy4-flash:free": { "context": 1048576, "output": 64000 },
+  "fr": {
+    "particle": { "context": 200000, "output": 64000 }
   }
 }
 ```
 
-Both numbers are optional. Copy [`examples/limits.json`](../examples/limits.json) to the OpenCode config directory and rename it to `.9router-sync-limits.json`.
+Precedence: override → upstream metadata → 9router caps. Both numbers are optional.
 
-## Custom DB queries
+## Cache behaviour
 
-Default router-key query:
+| Situation | Behaviour |
+|---|---|
+| Model probed OK | Reused for `ROUTER_PROBE_TTL` |
+| Model failed permanently | Reused; never added |
+| Model failed transiently | Reused for `ROUTER_FAIL_TTL`, existing model kept |
+| Upstream metadata | Reused per node + key fingerprint |
+| Router catalog unreachable | Last catalog used if under 1 hour old |
 
-```sql
-SELECT key FROM apiKeys WHERE isActive = 1 ORDER BY createdAt ASC LIMIT 1
-```
+`--refresh` bypasses all of it. Deleting the cache file is equivalent and also drops entries for models that no longer exist.
 
-Default provider-connection query:
+## Exit behaviour
 
-```sql
-SELECT provider, data FROM providerConnections WHERE isActive = 1
-```
-
-The `data` column is expected to be JSON containing `apiKey`, `key`, `token`, or `accessToken`.
-
-## Backups
-
-Before the first write, the script creates:
-
-```text
-opencode.json.bak-YYYYMMDD-HHMMSS
-```
-
-Disable this with `--no-backup`.
+- Never writes when the merged config is unchanged.
+- Never writes when zero models survive (unless `--no-probe` is used intentionally).
+- Refuses to overwrite malformed JSON/JSONC.
+- Refuses to overwrite an unmanaged provider on an ID collision.

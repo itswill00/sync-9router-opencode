@@ -1,5 +1,6 @@
 # Runtime state and local config
 .9router-sync-state.json
+.9router-sync-cache.json
 .9router-sync-limits.json
 opencode.json
 opencode.jsonc
